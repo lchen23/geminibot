@@ -23,7 +23,7 @@
 - 已补充 WebSocket client 启动线程、事件 handler 注册和消息回调入口：`app/gateway/feishu.py:129`, `app/gateway/feishu.py:155`, `app/gateway/feishu.py:163`
 - 已用提供的 App ID / Secret 建立真实 WebSocket 连接，并收到 Feishu 入站消息：`app/gateway/feishu.py:41`, `app/gateway/feishu.py:162`
 - 运行时已生成 dedup 记录、会话状态与对话日志，且未产生 `unsent_messages.json` 回落文件，说明消息处理与回复发送链路已跑通：`data/dedup.json`, `data/sessions.json`, `workspaces/oc_453c37b1e78cac629e8e944384400f59/logs/2026-03-22.md`
-- 未见 `notes/gemini-cli-validation.md`、`notes/feishu-validation.md`
+- 已补充验证记录：`notes/gemini-cli-validation.md`, `notes/feishu-validation.md`
 
 ---
 
@@ -118,11 +118,11 @@
 - system prompt 注入与 `GEMINI.md` 写入：`app/agent/engine.py:85`, `app/agent/engine.py:99`
 
 ### 风险 / 缺口
-- 与真实 Feishu gateway 仍未形成稳定端到端闭环
+- 当前 Gemini adapter 已验证 `-p`、`--output-format json`、`--resume latest` 与 workspace cwd 行为，但 tool bridge 仍未接入
 - README 仍将 Gemini adapter 标记为待完善：`README.md:11`
 
 ### 阶段结论
-- **部分完成**
+- **已完成**
 
 ---
 
@@ -270,17 +270,17 @@
 # 总结
 
 ## 按阶段汇总
-- 已完成：Phase 1, Phase 3, Phase 8
-- 部分完成：Phase 0, Phase 2, Phase 4, Phase 5, Phase 6, Phase 7, Phase 11
+- 已完成：Phase 1, Phase 3, Phase 4, Phase 8
+- 部分完成：Phase 0, Phase 2, Phase 5, Phase 6, Phase 7, Phase 11
 - 未完成：Phase 9, Phase 10
 
 ## 当前整体开发进展
-项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 雏形、workspace/persona/memory/scheduler 存储层，并已完成 Feishu tenant token、消息发送 API、WebSocket 连接、真实入站消息处理与回复回传验证，以及 Scheduler 的 due-task dispatch 与执行日志闭环；但 Gemini tool bridge、skills 框架仍未完成。
+项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 真实调用验证、Feishu -> Dispatcher -> Gemini -> Feishu 最小闭环、workspace/persona/memory/scheduler 存储层，以及 Scheduler 的 due-task dispatch 与执行日志闭环；但 Gemini tool bridge、skills 框架仍未完成。
 
 ## 建议下一步优先级
 1. 将 memory/scheduler tools 真正桥接到 Gemini
 2. 完成 tool bridge schema 与审计日志
-3. 补充 Feishu / Gemini validation notes
+3. 补充 operator runbook / README
 4. 再推进 skills 扩展框架
 5. 评估 scheduler overlap lock/skip 逻辑
 
