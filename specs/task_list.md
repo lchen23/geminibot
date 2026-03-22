@@ -13,14 +13,16 @@
 
 ### 任务状态
 - 部分完成：验证 Gemini CLI invocation model
-- 未完成：验证 Feishu WebSocket event subscription in Python
-- 未完成：验证 Feishu reply message/card API from Python
+- 部分完成：验证 Feishu WebSocket event subscription in Python
+- 部分完成：验证 Feishu reply message/card API from Python
 - 未完成：确定 Gemini tool bridge 最终方案（MCP 或命令包装）
 
 ### 依据
 - 已实现 Gemini CLI subprocess 调用、JSON 输出解析、resume 参数拼装：`app/agent/engine.py`
+- 已补充 Feishu tenant token 获取与消息发送 API 调用：`app/gateway/feishu.py:92`, `app/gateway/feishu.py:115`
+- 已补充 WebSocket client 启动线程、事件 handler 注册和消息回调入口：`app/gateway/feishu.py:129`, `app/gateway/feishu.py:155`, `app/gateway/feishu.py:163`
 - 未见 `notes/gemini-cli-validation.md`、`notes/feishu-validation.md`
-- `app/gateway/feishu.py` 仍为本地 stub，并未接入真实 Feishu SDK/WebSocket
+- 仍缺少真实环境下的端到端验证记录
 
 ---
 
@@ -51,21 +53,23 @@
 
 ### 任务状态
 - 部分完成：实现 `app/gateway/feishu.py`
-- 未完成：client initialization
-- 未完成：WebSocket startup
-- 未完成：event handler registration
+- 部分完成：client initialization
+- 部分完成：WebSocket startup
+- 部分完成：event handler registration
 - 部分完成：text extraction
-- 部分完成：card sending helper
+- 已完成：card sending helper
 - 已完成：实现 message dedup store in `data/dedup.json`
 - 已完成：定义 normalized `IncomingMessage` model
 - 部分完成：添加 temporary echo/stub dispatcher
 
 ### 依据
-- `FeishuGateway.start()` 仅打印本地模式日志：`app/gateway/feishu.py:21`
-- `handle_text_message()` 可接收文本并转交 Dispatcher：`app/gateway/feishu.py:24`
-- dedup 已使用 `data/dedup.json`：`app/gateway/feishu.py:18`
+- `FeishuGateway.start()` 现在会在配置存在时初始化 Feishu tenant token，并启动 WebSocket client 线程：`app/gateway/feishu.py:37`, `app/gateway/feishu.py:129`
+- 已注册 `register_p2_im_message_receive_v1` 回调，并将消息事件接入现有 Dispatcher 流程：`app/gateway/feishu.py:155`, `app/gateway/feishu.py:163`
+- `handle_text_message()` 可接收文本并转交 Dispatcher：`app/gateway/feishu.py:46`
+- dedup 已使用 `data/dedup.json`：`app/gateway/feishu.py:30`
 - `IncomingMessage` 已定义：`app/dispatcher.py:14`
-- 回复目前通过本地 `deliver()` 记录到 `unsent_messages.json`，并非真实 Feishu API：`app/gateway/feishu.py:53`
+- `deliver()` 已支持调用 Feishu send message API，失败时再落盘到 `unsent_messages.json`：`app/gateway/feishu.py:75`, `app/gateway/feishu.py:237`
+- 当前实现依赖 `lark-oapi`，且尚未完成真实环境联调
 
 ### 阶段结论
 - **部分完成**
@@ -270,10 +274,10 @@
 - 未完成：Phase 9, Phase 10
 
 ## 当前整体开发进展
-项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 雏形、workspace/persona/memory/scheduler 存储层；但真实 Feishu 接入、scheduler 执行闭环、Gemini tool bridge、skills 框架仍未完成。
+项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 雏形、workspace/persona/memory/scheduler 存储层，并补上了 Feishu tenant token、消息发送 API，以及 WebSocket client 启动与消息事件回调骨架；但真实环境联调、scheduler 执行闭环、Gemini tool bridge、skills 框架仍未完成。
 
 ## 建议下一步优先级
-1. 完成真实 Feishu WebSocket 与消息回复 API 接入
+1. 完成 Feishu WebSocket 真实环境联调与端到端验证
 2. 完成 SchedulerLoop 的 due-task dispatch 与执行日志
 3. 将 memory/scheduler tools 真正桥接到 Gemini
 4. 完成 tool bridge schema 与审计日志
@@ -284,13 +288,17 @@
 ## P0：打通真实 Feishu 收发闭环
 **目标**：先把“Feishu 发消息 → Python 服务 → Gemini → Feishu 回消息”跑通。
 
+### 当前进展
+- 已完成 tenant token 获取与真实消息发送 API 封装：`app/gateway/feishu.py:92`, `app/gateway/feishu.py:115`
+- 已完成 WebSocket client 启动线程、事件 handler 注册与消息回调骨架：`app/gateway/feishu.py:129`, `app/gateway/feishu.py:155`, `app/gateway/feishu.py:163`
+- 仍缺少真实环境联调与端到端验证记录
+
 ### 待办
-1. 在 `app/gateway/feishu.py` 接入真实 Feishu client 初始化
-2. 实现 WebSocket 启动与事件订阅
-3. 注册消息事件处理器，提取文本消息
-4. 实现真实消息回复接口
-5. 保留并接入现有 dedup 逻辑
-6. 验证 Dispatcher 返回结果能真实发回 Feishu
+1. 在真实 Feishu 环境验证 WebSocket 连接成功
+2. 验证消息事件能进入现有 dedup + Dispatcher 流程
+3. 验证 Dispatcher 返回结果能真实发回 Feishu
+4. 补一轮端到端手工验证并记录结果
+5. 视联调结果修正 event payload 字段映射
 
 ### 交付标准
 - 在 Feishu 发 `hello`
