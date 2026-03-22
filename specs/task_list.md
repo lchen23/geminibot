@@ -192,21 +192,22 @@
 
 ### 任务状态
 - 已完成：实现 `app/scheduler/store.py`
-- 部分完成：实现 `app/scheduler/loop.py`
+- 已完成：实现 `app/scheduler/loop.py`
 - 已完成：在 `main.py` 启动 polling loop
 - 已完成：支持 cron 和 one-time schedules
-- 未完成：将 due tasks 路由回 Dispatcher
+- 已完成：将 due tasks 路由回 Dispatcher
 - 已完成：添加 `/tasks` 命令
-- 未完成：添加 schedule execution logging
+- 已完成：添加 schedule execution logging
 
 ### 依据
 - SchedulerStore 已支持 create/list/due/delete/mark executed：`app/scheduler/store.py`
-- `SchedulerLoop` 当前仅启动线程并 sleep：`app/scheduler/loop.py:22`, `app/scheduler/loop.py:30`
-- `main.py` 已启动 scheduler：`app/main.py:16`
+- `SchedulerLoop` 已轮询 due task、调用 `dispatcher.dispatch_scheduled_task()`、投递消息并记录执行日志：`app/scheduler/loop.py:35`, `app/scheduler/loop.py:40`, `app/scheduler/loop.py:59`
+- `main.py` 已在启动时注入 `gateway.deliver` 并启动 scheduler：`app/main.py:16`, `app/main.py:18`
+- 已通过一次到期任务 smoke test 验证执行链路，任务被消费且写入 `data/schedule_runs.json`
 - `/tasks` 命令：`app/dispatcher.py:43`
 
 ### 阶段结论
-- **部分完成**
+- **已完成**
 
 ---
 
@@ -269,19 +270,19 @@
 # 总结
 
 ## 按阶段汇总
-- 已完成：Phase 1, Phase 3
-- 部分完成：Phase 0, Phase 2, Phase 4, Phase 5, Phase 6, Phase 7, Phase 8, Phase 11
+- 已完成：Phase 1, Phase 3, Phase 8
+- 部分完成：Phase 0, Phase 2, Phase 4, Phase 5, Phase 6, Phase 7, Phase 11
 - 未完成：Phase 9, Phase 10
 
 ## 当前整体开发进展
-项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 雏形、workspace/persona/memory/scheduler 存储层，并已完成 Feishu tenant token、消息发送 API、WebSocket 连接、真实入站消息处理与回复回传验证；但 scheduler 执行闭环、Gemini tool bridge、skills 框架仍未完成。
+项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 雏形、workspace/persona/memory/scheduler 存储层，并已完成 Feishu tenant token、消息发送 API、WebSocket 连接、真实入站消息处理与回复回传验证，以及 Scheduler 的 due-task dispatch 与执行日志闭环；但 Gemini tool bridge、skills 框架仍未完成。
 
 ## 建议下一步优先级
-1. 完成 SchedulerLoop 的 due-task dispatch 与执行日志
-2. 将 memory/scheduler tools 真正桥接到 Gemini
-3. 完成 tool bridge schema 与审计日志
-4. 补充 Feishu / Gemini validation notes
-5. 再推进 skills 扩展框架
+1. 将 memory/scheduler tools 真正桥接到 Gemini
+2. 完成 tool bridge schema 与审计日志
+3. 补充 Feishu / Gemini validation notes
+4. 再推进 skills 扩展框架
+5. 评估 scheduler overlap lock/skip 逻辑
 
 # 下一轮开发待办
 
@@ -312,13 +313,14 @@
 ## P1：补完 Scheduler 执行闭环
 **目标**：让 reminder / cron 不只是存下来，而是真正触发执行。
 
+### 当前进展
+- 已完成 due task 轮询、Dispatcher 路由、消息投递、任务状态更新与执行日志落盘
+- 已通过一次到期任务 smoke test，确认任务被消费且写入 `data/schedule_runs.json`
+
 ### 待办
-1. 在 `app/scheduler/loop.py` 中轮询 due tasks
-2. 把 due task 转成统一请求对象并路由到 Dispatcher
-3. 执行成功后更新任务状态
-4. 增加 schedule execution logging
-5. 处理 one-time 与 cron 的不同执行后状态
-6. 验证 `/tasks` 展示结果与实际执行一致
+1. 在真实 Feishu 场景验证一次性提醒自动投递
+2. 在真实 Feishu 场景验证 cron 任务的 next_run_at 更新
+3. 如有需要，补充更细的失败重试/告警策略
 
 ### 交付标准
 - 创建一次性 reminder
@@ -327,10 +329,10 @@
 - `schedules.json` 状态被正确更新
 
 ### 相关代码
-- `app/scheduler/loop.py:22`
+- `app/scheduler/loop.py:17`
 - `app/scheduler/store.py:13`
 - `app/main.py:16`
-- `app/dispatcher.py:43`
+- `app/dispatcher.py:73`
 
 ## P2：把 memory / scheduler tools 真正桥接到 Gemini
 **目标**：让 agent 能自己调用 memory 和 schedule，而不是全靠 Dispatcher 写死命令。

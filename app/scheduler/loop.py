@@ -3,19 +3,24 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime
+from typing import Callable
 
 from app.config import AppConfig
 from app.dispatcher import Dispatcher
 from app.scheduler.store import SchedulerStore
+from app.utils.state import JsonListState
 
 logger = logging.getLogger(__name__)
 
 
 class SchedulerLoop:
-    def __init__(self, config: AppConfig, dispatcher: Dispatcher) -> None:
+    def __init__(self, config: AppConfig, dispatcher: Dispatcher, deliver_message: Callable[[str, dict], None]) -> None:
         self.config = config
         self.dispatcher = dispatcher
+        self.deliver_message = deliver_message
         self.store = SchedulerStore(config)
+        self.execution_log = JsonListState(config.data_root / "schedule_runs.json")
         self._thread: threading.Thread | None = None
         self._running = False
 
@@ -29,5 +34,50 @@ class SchedulerLoop:
 
     def _run(self) -> None:
         while self._running:
+            self._dispatch_due_tasks()
             time.sleep(self.config.poll_interval_seconds)
-            # Placeholder for due-task evaluation and dispatch.
+
+    def _dispatch_due_tasks(self) -> None:
+        now = datetime.utcnow()
+        due_tasks = self.store.get_due_tasks(now=now)
+        if not due_tasks:
+            return
+
+        for task in due_tasks:
+            task_id = task.get("id", "unknown")
+            logger.info("Dispatching scheduled task id=%s conversation_id=%s", task_id, task.get("conversation_id"))
+            try:
+                response = self.dispatcher.dispatch_scheduled_task(task)
+                self.deliver_message(task["chat_id"], response)
+                updated_task = self.store.mark_task_executed(task_id, run_at=now)
+                self._append_execution_log(task=task, status="success", run_at=now, result=updated_task)
+                logger.info("Scheduled task executed id=%s next_run_at=%s", task_id, updated_task.get("next_run_at") if updated_task else None)
+            except Exception as exc:
+                self._append_execution_log(task=task, status="failed", run_at=now, error=str(exc))
+                logger.exception("Scheduled task failed id=%s", task_id)
+
+    def _append_execution_log(
+        self,
+        *,
+        task: dict,
+        status: str,
+        run_at: datetime,
+        result: dict | None = None,
+        error: str | None = None,
+    ) -> None:
+        logs = self.execution_log.read()
+        logs.append(
+            {
+                "task_id": task.get("id"),
+                "chat_id": task.get("chat_id"),
+                "conversation_id": task.get("conversation_id"),
+                "prompt": task.get("prompt"),
+                "schedule_type": task.get("schedule_type"),
+                "status": status,
+                "run_at": run_at.isoformat(),
+                "next_run_at": result.get("next_run_at") if result else None,
+                "last_run_at": result.get("last_run_at") if result else None,
+                "error": error,
+            }
+        )
+        self.execution_log.write(logs)

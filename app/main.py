@@ -13,7 +13,7 @@ def main() -> None:
 
     dispatcher = Dispatcher(config=config)
     gateway = FeishuGateway(config=config, dispatcher=dispatcher)
-    scheduler = SchedulerLoop(config=config, dispatcher=dispatcher)
+    scheduler = SchedulerLoop(config=config, dispatcher=dispatcher, deliver_message=gateway.deliver)
 
     scheduler.start()
     gateway.start()
