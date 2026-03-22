@@ -9,8 +9,7 @@ from typing import Any
 from urllib import error, request
 
 try:
-    from lark import EventDispatcherHandler, ws
-    from lark.model import LogLevel
+    from lark_oapi import EventDispatcherHandler, LogLevel, ws
 except ModuleNotFoundError:  # pragma: no cover - optional runtime fallback
     EventDispatcherHandler = None
     ws = None

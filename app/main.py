@@ -1,3 +1,5 @@
+import time
+
 from app.config import AppConfig
 from app.dispatcher import Dispatcher
 from app.gateway.feishu import FeishuGateway
@@ -15,6 +17,12 @@ def main() -> None:
 
     scheduler.start()
     gateway.start()
+
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
