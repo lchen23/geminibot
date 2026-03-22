@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,7 @@ class GeminiAgentEngine:
         system_prompt = self._build_system_prompt(workspace)
         self._write_gemini_context_file(workspace, system_prompt)
         command = self._build_command(request, session)
+        env = self._build_environment(request, workspace)
 
         try:
             completed = subprocess.run(
@@ -49,7 +51,7 @@ class GeminiAgentEngine:
                 check=False,
                 capture_output=True,
                 text=True,
-                env=None,
+                env=env,
             )
         except FileNotFoundError:
             return AgentResult(
@@ -91,6 +93,10 @@ class GeminiAgentEngine:
                 if content:
                     parts.append(f"## {filename}\n{content}")
 
+        tool_guide = self._read_tool_guide(workspace)
+        if tool_guide:
+            parts.append(f"## TOOL_BRIDGE.md\n{tool_guide}")
+
         recent = self.memory_store.read_recent_summaries(workspace=workspace, days=self.config.recent_summary_days)
         if recent:
             parts.append(f"## Recent Summaries\n{recent}")
@@ -114,6 +120,26 @@ class GeminiAgentEngine:
         if session and session.get("resume"):
             command.extend(["--resume", session["resume"]])
         return command
+
+    def _build_environment(self, request: AgentRequest, workspace: Path) -> dict[str, str]:
+        env = os.environ.copy()
+        env.update(
+            {
+                "GEMINIBOT_PROJECT_ROOT": str(self.workspace_manager.project_root),
+                "GEMINIBOT_WORKSPACE": str(workspace),
+                "GEMINIBOT_CONVERSATION_ID": request.conversation_id,
+                "GEMINIBOT_CHAT_ID": request.chat_id,
+                "GEMINIBOT_USER_ID": request.user_id,
+                "GEMINIBOT_TIMEZONE": self.config.default_timezone,
+            }
+        )
+        return env
+
+    def _read_tool_guide(self, workspace: Path) -> str:
+        guide_path = workspace / "tools" / "README.md"
+        if not guide_path.exists():
+            return ""
+        return guide_path.read_text(encoding="utf-8").strip()
 
     def _parse_output(self, stdout: str, stderr: str) -> AgentResult:
         raw_output = self._join_output(stdout, stderr)

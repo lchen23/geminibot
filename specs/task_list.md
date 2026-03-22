@@ -15,7 +15,7 @@
 - 部分完成：验证 Gemini CLI invocation model
 - 已完成：验证 Feishu WebSocket event subscription in Python
 - 已完成：验证 Feishu reply message/card API from Python
-- 未完成：确定 Gemini tool bridge 最终方案（MCP 或命令包装）
+- 已完成：确定 Gemini tool bridge 最终方案（本地命令包装）
 
 ### 依据
 - 已实现 Gemini CLI subprocess 调用、JSON 输出解析、resume 参数拼装：`app/agent/engine.py`
@@ -24,6 +24,7 @@
 - 已用提供的 App ID / Secret 建立真实 WebSocket 连接，并收到 Feishu 入站消息：`app/gateway/feishu.py:41`, `app/gateway/feishu.py:162`
 - 运行时已生成 dedup 记录、会话状态与对话日志，且未产生 `unsent_messages.json` 回落文件，说明消息处理与回复发送链路已跑通：`data/dedup.json`, `data/sessions.json`, `workspaces/oc_453c37b1e78cac629e8e944384400f59/logs/2026-03-22.md`
 - 已补充验证记录：`notes/gemini-cli-validation.md`, `notes/feishu-validation.md`
+- 已确定 v1 采用 workspace 内本地命令包装方式桥接 tool，并生成工具脚本与使用说明：`app/agent/workspace.py:12`, `app/agent/workspace.py:169`, `app/agent/workspace.py:235`
 
 ---
 
@@ -118,7 +119,7 @@
 - system prompt 注入与 `GEMINI.md` 写入：`app/agent/engine.py:85`, `app/agent/engine.py:99`
 
 ### 风险 / 缺口
-- 当前 Gemini adapter 已验证 `-p`、`--output-format json`、`--resume latest` 与 workspace cwd 行为，但 tool bridge 仍未接入
+- 当前 Gemini adapter 已验证 `-p`、`--output-format json`、`--resume latest` 与 workspace cwd 行为，并已向 workspace 注入本地 tool bridge 脚本与上下文环境，但 Gemini CLI 对这些工具的自然语言调用效果仍需真实对话验收
 - README 仍将 Gemini adapter 标记为待完善：`README.md:11`
 
 ### 阶段结论
@@ -214,19 +215,25 @@
 ## Phase 9 — Tool Bridge for Gemini
 
 ### 任务状态
-- 未完成：确定最终 tool bridge 方案
-- 部分完成：暴露 memory tools
-- 部分完成：暴露 scheduler tools
-- 未完成：定义 input/output schemas
-- 未完成：添加 audit logging for tool invocations
+- 已完成：确定最终 tool bridge 方案（workspace 本地命令包装）
+- 已完成：暴露 memory tools
+- 已完成：暴露 scheduler tools
+- 已完成：定义 input/output schemas
+- 已完成：添加 audit logging for tool invocations
+- 已完成：将 tool 使用说明注入 Gemini workspace 上下文
+- 部分完成：完成自然语言自主调用验收（执行链路已验证，受 Gemini API 429 容量限制阻塞）
 
 ### 依据
-- `app/memory/tools.py` 与 `app/scheduler/tools.py` 已存在
-- 但未见这些工具被真正接入 Gemini CLI 调用链
-- 未见 schema 定义与审计日志实现
+- `app/memory/tools.py` 与 `app/scheduler/tools.py` 已存在，并通过 `tools/tool_bridge.py` 统一暴露给 workspace：`app/memory/tools.py:7`, `app/scheduler/tools.py:7`, `app/agent/workspace.py:12`
+- workspace 初始化会自动生成 `tools/tool_bridge.py` 与 `tools/README.md`，提供命令入口和参数 schema：`app/agent/workspace.py:219`, `app/agent/workspace.py:235`
+- Gemini 运行环境已注入 conversation/chat/user 上下文，供工具脚本读取：`app/agent/engine.py:124`
+- system prompt 已注入工具说明，便于 Gemini 在 workspace 中发现工具：`app/agent/engine.py:87`, `app/agent/engine.py:132`
+- 每次工具调用都会写入 workspace 下的 `tool_audit.jsonl`：`app/agent/workspace.py:53`
+- 已用 smoke test 验证 `memory_save` 与 `list_tasks` 命令可执行并返回 JSON：`workspaces/tool-bridge-smoke/tools/tool_bridge.py`, `workspaces/tool-bridge-smoke/tool_audit.jsonl`
+- 已使用真实 Gemini CLI 触发自然语言验收请求，但当前调用被 Gemini 服务端 `429 MODEL_CAPACITY_EXHAUSTED` 阻塞，尚未产生 `tool_audit.jsonl`、`MEMORY.md` 或 `schedules.json` 的新增变更：`workspaces/tool-bridge-acceptance/GEMINI.md`, `workspaces/tool-bridge-acceptance/MEMORY.md`, `data/schedules.json`
 
 ### 阶段结论
-- **未完成**
+- **部分完成**
 
 ---
 
@@ -271,18 +278,18 @@
 
 ## 按阶段汇总
 - 已完成：Phase 1, Phase 3, Phase 4, Phase 8
-- 部分完成：Phase 0, Phase 2, Phase 5, Phase 6, Phase 7, Phase 11
-- 未完成：Phase 9, Phase 10
+- 部分完成：Phase 0, Phase 2, Phase 5, Phase 6, Phase 7, Phase 9, Phase 11
+- 未完成：Phase 10
 
 ## 当前整体开发进展
-项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 真实调用验证、Feishu -> Dispatcher -> Gemini -> Feishu 最小闭环、workspace/persona/memory/scheduler 存储层，以及 Scheduler 的 due-task dispatch 与执行日志闭环；但 Gemini tool bridge、skills 框架仍未完成。
+项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 真实调用验证、Feishu -> Dispatcher -> Gemini -> Feishu 最小闭环、workspace/persona/memory/scheduler 存储层、Scheduler 的 due-task dispatch 与执行日志闭环，以及 v1 本地命令包装式 tool bridge 骨架；本轮已发起真实 Gemini 自然语言验收，但受 Gemini 服务端 `429 MODEL_CAPACITY_EXHAUSTED` 限制，尚未完成 memory/scheduler tools 的最终自主调用验收，skills 框架也仍未完成。
 
 ## 建议下一步优先级
-1. 将 memory/scheduler tools 真正桥接到 Gemini
-2. 完成 tool bridge schema 与审计日志
-3. 补充 operator runbook / README
-4. 再推进 skills 扩展框架
-5. 评估 scheduler overlap lock/skip 逻辑
+1. 在 Gemini 服务容量恢复后，重跑 memory / scheduler tools 的真实自然语言验收
+2. 补充 operator runbook / README
+3. 再推进 skills 扩展框架
+4. 评估 scheduler overlap lock/skip 逻辑
+5. 补 required config 的 startup self-checks
 
 # 下一轮开发待办
 
@@ -334,20 +341,23 @@
 - `app/main.py:16`
 - `app/dispatcher.py:73`
 
-## P2：把 memory / scheduler tools 真正桥接到 Gemini
-**目标**：让 agent 能自己调用 memory 和 schedule，而不是全靠 Dispatcher 写死命令。
+## P2：验收 Gemini 对 memory / scheduler tools 的自主调用
+**目标**：让 agent 不依赖 Dispatcher 硬编码命令，也能从自然语言中真正调用 memory 和 schedule。
+
+### 当前进展
+- 已确定 tool bridge 方案为 workspace 内本地命令包装
+- 已接入 `app/memory/tools.py` 与 `app/scheduler/tools.py`
+- 已生成工具脚本、参数 schema 文档和 audit log
+- 已完成 `memory_save` / `list_tasks` smoke test
+- 已发起真实 Gemini 对话验收请求，但调用被 Gemini 服务端 `429 MODEL_CAPACITY_EXHAUSTED` 阻塞
 
 ### 待办
-1. 先确定 tool bridge 方案
-   - MCP
-   - 或本地命令包装
-2. 接入 `app/memory/tools.py`
-3. 接入 `app/scheduler/tools.py`
-4. 定义统一输入输出 schema
-5. 增加工具调用审计日志
-6. 做一次自然语言触发验证：
+1. 在 Gemini 服务容量恢复后，重跑 memory 保存触发验收
    - “记住我喜欢简洁回复”
+2. 在 Gemini 服务容量恢复后，重跑 schedule 创建触发验收
    - “明天下午三点提醒我开会”
+3. 观察 `tool_audit.jsonl`、`MEMORY.md`、`schedules.json` 是否正确变化
+4. 如 Gemini 对工具发现不稳定，再迭代 prompt / tool docs
 
 ### 交付标准
 - agent 能从自然语言中自主调用 memory / scheduler 能力
@@ -356,7 +366,8 @@
 ### 相关代码
 - `app/memory/tools.py:7`
 - `app/scheduler/tools.py:7`
-- `app/agent/engine.py:106`
+- `app/agent/workspace.py:12`
+- `app/agent/engine.py:124`
 
 ## P3：补齐 Gemini CLI 适配验证与稳定性
 **目标**：把现在“能调用”提升到“行为确认稳定”。
