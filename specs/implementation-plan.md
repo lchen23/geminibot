@@ -1,7 +1,7 @@
 # GeminiBot Implementation Plan
 
 ## Summary
-This plan turns the existing GeminiBot spec into an executable build sequence. It prioritizes a usable Feishu-to-Gemini chat loop first, then adds durable memory, proactive scheduling, and finally skill extensions. The plan is optimized for a local-first Python service with file-based persistence and minimal infrastructure.
+This plan turns the existing GeminiBot spec into an executable build sequence. It prioritizes a usable Feishu-to-Gemini chat loop first, then adds durable session continuity and proactive scheduling. The plan is optimized for a local-first Python service with file-based persistence and minimal infrastructure.
 
 ## Delivery Strategy
 - Build thin vertical slices instead of isolated modules.
@@ -96,9 +96,7 @@ Introduce the central orchestration layer.
 - Add built-in command parsing for:
   - `/help`
   - `/clear`
-  - `/remember`
   - `/tasks`
-- Add daily log append hook.
 - Add card rendering adapter.
 
 ### Deliverables
@@ -129,7 +127,7 @@ Replace stub replies with Gemini CLI execution.
 
 ## Phase 5 — Persona and Workspace System
 ### Goal
-Make the assistant feel persistent and personalized.
+Make the assistant feel persistent while keeping state minimal.
 
 ### Tasks
 - Create template files:
@@ -137,58 +135,18 @@ Make the assistant feel persistent and personalized.
   - `IDENTITY.md`
   - `USER.md`
   - `AGENT.md`
-  - `MEMORY.md`
 - Implement workspace initialization from templates.
 - Ensure persona files are injected on every agent run.
 - Add session metadata file per workspace.
 
 ### Deliverables
-- personalized per-conversation workspace model
+- per-conversation workspace model with persona files and session metadata
 
 ### Exit Criteria
 - Editing workspace persona files changes assistant behavior on the next turn.
+- Restarting the service preserves Gemini session continuity for an existing conversation.
 
-## Phase 6 — Memory System v1
-### Goal
-Add persistent logs and long-term memory.
-
-### Tasks
-- Implement `app/memory/store.py`:
-  - daily log append
-  - memory read/write
-  - summary read/write
-- Implement `/remember` command.
-- Inject `MEMORY.md` into agent prompt.
-- Add recent summary loading logic.
-- Define initial tool bridge interfaces for:
-  - `memory_search`
-  - `memory_list_by_date`
-  - `memory_save`
-
-### Deliverables
-- readable memory files with memory-aware conversations
-
-### Exit Criteria
-- User can save a preference and the agent recalls it in a later turn.
-
-## Phase 7 — Memory Consolidation
-### Goal
-Turn raw logs into concise reusable memory.
-
-### Tasks
-- Implement `app/memory/consolidate.py`.
-- Trigger consolidation on `/clear`.
-- Summarize new log segments.
-- Rewrite `MEMORY.md` with deduplicated content.
-- Add failure-safe behavior if consolidation fails.
-
-### Deliverables
-- `/clear` resets current context but preserves learned facts
-
-### Exit Criteria
-- After `/clear`, important preferences remain available while turn-level context is cleared.
-
-## Phase 8 — Scheduler v1
+## Phase 6 — Scheduler v1
 ### Goal
 Allow proactive tasks via cron and once schedules.
 
@@ -207,7 +165,7 @@ Allow proactive tasks via cron and once schedules.
 ### Exit Criteria
 - User can create a reminder and receive it at the scheduled time in Feishu.
 
-## Phase 9 — Tool Bridge for Gemini
+## Phase 7 — Tool Bridge for Gemini
 ### Goal
 Expose Python-side capabilities to the Gemini agent cleanly.
 
@@ -215,35 +173,17 @@ Expose Python-side capabilities to the Gemini agent cleanly.
 - Finalize one tool bridge approach:
   - MCP if Gemini CLI supports it well
   - otherwise subprocess-exposed local command tools
-- Expose memory tools.
 - Expose scheduler tools.
 - Define input/output schemas.
 - Add audit logging for tool invocations.
 
 ### Deliverables
-- Gemini agent can read/write memory and schedules without hardcoded dispatcher shortcuts
+- Gemini agent can create and manage schedules without hardcoded dispatcher shortcuts
 
 ### Exit Criteria
-- Agent can autonomously save memory or create a schedule from natural language.
+- Agent can create a schedule from natural language.
 
-## Phase 10 — Skill Extension Framework
-### Goal
-Support specialized workflows without changing core modules.
-
-### Tasks
-- Define `skills/` directory contract.
-- Add skill discovery and mounting into workspaces.
-- Add instruction loading rules.
-- Add local Python tool wrappers for skill APIs.
-- Create one reference skill stub.
-
-### Deliverables
-- pluggable skill system
-
-### Exit Criteria
-- A new skill can be added by dropping files into the skills directory.
-
-## Phase 11 — Hardening and Operator Experience
+## Phase 8 — Hardening and Operator Experience
 ### Goal
 Make the system maintainable for daily use.
 
@@ -278,11 +218,6 @@ Make the system maintainable for daily use.
 
 ### Milestone D
 - Phase 8
-- Phase 9
-
-### Milestone E
-- Phase 10
-- Phase 11
 
 ## Test Plan by Phase
 
@@ -291,19 +226,17 @@ Make the system maintainable for daily use.
 - workspace bootstrap
 - dedup file updates
 - session persistence
-- daily log writing
 - schedule next-run calculation
 
 ### Integration Tests
 - Feishu message -> Dispatcher -> stub reply
 - Feishu message -> Gemini CLI -> reply
-- `/clear` -> consolidation -> new conversation
+- `/clear` -> session reset -> new conversation
 - schedule creation -> due execution -> Feishu delivery
 
 ### Manual Acceptance Tests
-- multi-turn memory recall
-- explicit remember preference
 - restart process and continue conversation
+- clear a conversation session and verify a fresh Gemini run
 - run one-time reminder
 - run daily recurring reminder
 
@@ -318,7 +251,6 @@ Create these first for the skeleton:
 - `app/agent/engine.py`
 - `app/agent/workspace.py`
 - `app/agent/session_store.py`
-- `app/memory/store.py`
 - `app/scheduler/store.py`
 - `app/scheduler/loop.py`
 - `app/rendering/cards.py`
@@ -330,16 +262,14 @@ Create these first for the skeleton:
 3. dispatcher
 4. Gemini adapter
 5. workspace bootstrap
-6. memory files
-7. scheduler
-8. tool bridge
-9. skills
+6. scheduler
+7. tool bridge
+8. hardening
 
 ## Definition of Done
 The implementation is considered successful when:
 - the service runs locally from a single command
 - Feishu chat works end-to-end through Gemini CLI
-- persona and memory persist on disk
+- Gemini session continuity persists on disk across restarts
 - scheduled reminders work
 - code structure matches the spec closely enough for future iteration
-- adding a new skill does not require redesigning the core architecture
