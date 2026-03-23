@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -11,7 +12,7 @@ from app.rendering.cards import build_markdown_reply
 from app.scheduler.store import SchedulerStore
 
 
-@dataclass(slots=True)
+@dataclass
 class IncomingMessage:
     message_id: str
     chat_id: str
@@ -29,8 +30,13 @@ class Dispatcher:
         self.scheduler_store = SchedulerStore(config)
         self.agent = GeminiAgentEngine(config=config, memory_store=self.memory_store)
 
-    def handle(self, message: IncomingMessage) -> dict:
+    def handle_stream(
+        self,
+        message: IncomingMessage,
+        on_event: Callable[[dict], None] | None = None,
+    ) -> tuple[dict, list[dict]]:
         text = message.text.strip()
+        events: list[dict] = []
 
         if text == "/help":
             reply = self._help_text()
@@ -49,16 +55,18 @@ class Dispatcher:
             deleted = self.scheduler_store.delete_task(task_id)
             reply = f"Deleted task: {task_id}" if deleted else f"Task not found: {task_id}"
         else:
-            result = self.agent.run(
+            stream_result = self.agent.run_stream(
                 AgentRequest(
                     conversation_id=message.conversation_id,
                     chat_id=message.chat_id,
                     user_id=message.user_id,
                     text=message.text,
                     source=message.source,
-                )
+                ),
+                on_event=on_event,
             )
-            reply = result.text
+            reply = stream_result.result.text
+            events = stream_result.events
 
         self.memory_store.append_daily_log(
             conversation_id=message.conversation_id,
@@ -68,7 +76,11 @@ class Dispatcher:
         footer = None
         if message.source == "scheduler":
             footer = "Scheduled task"
-        return build_markdown_reply(reply, footer=footer)
+        return build_markdown_reply(reply, footer=footer), events
+
+    def handle(self, message: IncomingMessage) -> dict:
+        payload, _events = self.handle_stream(message)
+        return payload
 
     def dispatch_scheduled_task(self, task: dict) -> dict:
         return self.handle(

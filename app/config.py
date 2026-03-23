@@ -11,7 +11,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional runtime fallback
         return False
 
 
-@dataclass(slots=True)
+@dataclass
 class AppConfig:
     feishu_app_id: str
     feishu_app_secret: str

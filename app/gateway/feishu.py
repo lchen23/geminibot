@@ -67,7 +67,13 @@ class FeishuGateway:
             text=text,
             sent_at=datetime.now(timezone.utc).isoformat(),
         )
-        response = self.dispatcher.handle(request_message)
+        stream_state = self._build_stream_state(chat_id) if self._has_credentials() else None
+        stream_callback = stream_state["callback"] if stream_state else None
+        response, _events = self.dispatcher.handle_stream(request_message, on_event=stream_callback)
+        if stream_state and stream_state["message_id"]:
+            self._update_card_message(stream_state["message_id"], response)
+            logger.info("Prepared streamed response for chat_id=%s message_id=%s", chat_id, stream_state["message_id"])
+            return None
         logger.info("Prepared response for chat_id=%s", chat_id)
         return response
 
@@ -111,7 +117,7 @@ class FeishuGateway:
         self._tenant_token_expires_at = now + int(payload.get("expire", 7200))
         return token
 
-    def _send_card_message(self, chat_id: str, payload: dict) -> None:
+    def _send_card_message(self, chat_id: str, payload: dict) -> dict:
         token = self._get_tenant_access_token()
         response_payload = self._post_json(
             url="https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
@@ -124,6 +130,81 @@ class FeishuGateway:
         )
         if response_payload.get("code") != 0:
             raise RuntimeError(f"Feishu send failed: {response_payload.get('msg', 'unknown error')}")
+        return response_payload
+
+    def _update_card_message(self, message_id: str, payload: dict) -> None:
+        token = self._get_tenant_access_token()
+        response_payload = self._patch_json(
+            url=f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}",
+            body={
+                "content": json.dumps(payload, ensure_ascii=False),
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if response_payload.get("code") != 0:
+            raise RuntimeError(f"Feishu update failed: {response_payload.get('msg', 'unknown error')}")
+
+    def _build_stream_state(self, chat_id: str) -> dict:
+        initial_payload = self._build_stream_payload("Generating…")
+        response_payload = self._send_card_message(chat_id, initial_payload)
+        message_id = (((response_payload.get("data") or {}).get("message") or {}).get("message_id"))
+        sent_text = ""
+
+        def callback(event: dict) -> None:
+            nonlocal sent_text
+            if not message_id:
+                return
+            updated_text = self._apply_stream_event(sent_text, event)
+            if updated_text is None or updated_text == sent_text:
+                return
+            sent_text = updated_text
+            self._update_card_message(message_id, self._build_stream_payload(sent_text))
+
+        return {
+            "message_id": message_id,
+            "callback": callback,
+        }
+
+    def _build_stream_payload(self, text: str) -> dict:
+        return {
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": text or "…"},
+                ]
+            },
+        }
+
+    def _apply_stream_event(self, current_text: str, event: dict) -> str | None:
+        message = event.get("message")
+        if isinstance(message, dict):
+            message_text = self._extract_message_text(message)
+            if message_text is not None:
+                return message_text
+
+        event_type = event.get("type")
+        if event_type == "content_block_delta":
+            delta = event.get("delta")
+            if isinstance(delta, dict) and delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+                return current_text + delta["text"]
+        if event_type == "content_block_start":
+            content_block = event.get("content_block")
+            if isinstance(content_block, dict) and content_block.get("type") == "text" and isinstance(content_block.get("text"), str):
+                return current_text + content_block["text"]
+        return None
+
+    def _extract_message_text(self, message: dict) -> str | None:
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None
+
+        text_parts: list[str] = []
+        for block in content:
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                text_parts.append(block["text"])
+        if not text_parts:
+            return None
+        return "".join(text_parts)
 
     def _start_websocket_client(self) -> None:
         if self._ws_thread and self._ws_thread.is_alive():
@@ -207,6 +288,12 @@ class FeishuGateway:
         return ""
 
     def _post_json(self, *, url: str, body: dict, headers: dict[str, str] | None = None) -> dict:
+        return self._request_json(url=url, body=body, headers=headers, method="POST")
+
+    def _patch_json(self, *, url: str, body: dict, headers: dict[str, str] | None = None) -> dict:
+        return self._request_json(url=url, body=body, headers=headers, method="PATCH")
+
+    def _request_json(self, *, url: str, body: dict, headers: dict[str, str] | None = None, method: str) -> dict:
         request_headers = {
             "Content-Type": "application/json; charset=utf-8",
         }
@@ -217,7 +304,7 @@ class FeishuGateway:
             url,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             headers=request_headers,
-            method="POST",
+            method=method,
         )
         try:
             with request.urlopen(http_request, timeout=10) as response:
