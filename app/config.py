@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +10,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - optional runtime fallback
     def load_dotenv() -> bool:
         return False
+
+
+@dataclass(slots=True)
+class StartupCheckResult:
+    warnings: list[str]
 
 
 @dataclass(slots=True)
@@ -49,6 +55,23 @@ class AppConfig:
         )
         config.ensure_directories()
         return config
+
+    def run_startup_checks(self) -> StartupCheckResult:
+        if not self.feishu_app_id or not self.feishu_app_secret:
+            raise ValueError("Missing required Feishu configuration: FEISHU_APP_ID and FEISHU_APP_SECRET are required.")
+        if not self.gemini_cli_path.strip():
+            raise ValueError("Missing required Gemini configuration: GEMINI_CLI_PATH is required.")
+        if shutil.which(self.gemini_cli_path) is None:
+            raise ValueError(f"Gemini CLI was not found on PATH: {self.gemini_cli_path}")
+        if not self.workspace_root.exists() or not self.workspace_root.is_dir():
+            raise ValueError(f"Workspace root is not available: {self.workspace_root}")
+        if not self.data_root.exists() or not self.data_root.is_dir():
+            raise ValueError(f"Data root is not available: {self.data_root}")
+
+        warnings: list[str] = []
+        if not self.gemini_api_key:
+            warnings.append("GEMINI_API_KEY is not set; Gemini CLI must already be authenticated via its own local session.")
+        return StartupCheckResult(warnings=warnings)
 
     def ensure_directories(self) -> None:
         self.workspace_root.mkdir(parents=True, exist_ok=True)

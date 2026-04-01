@@ -31,6 +31,8 @@ Required runtime fields:
 - `FEISHU_APP_SECRET`
 - `GEMINI_CLI_PATH` (default and recommended: `gemini`)
 
+Startup self-checks now validate these on boot, and also verify that the configured Gemini CLI is available on `PATH` and that `WORKSPACE_ROOT` / `DATA_ROOT` resolve to usable directories.
+
 Important optional fields:
 - `DEFAULT_TIMEZONE` — default schedule timezone
 - `WORKSPACE_ROOT` — per-conversation workspace directory
@@ -50,9 +52,10 @@ python -m app.main
 Startup flow:
 1. Load environment and initialize data/workspace directories
 2. Configure logging
-3. Create Dispatcher, Feishu gateway, and scheduler loop
-4. Start scheduler polling thread
-5. Start Feishu WebSocket client when credentials are present
+3. Run startup self-checks for required config, CLI availability, and core directories
+4. Create Dispatcher, Feishu gateway, and scheduler loop
+5. Start scheduler polling thread
+6. Start Feishu WebSocket client when credentials are present
 
 See `app/main.py:10`.
 
@@ -61,7 +64,7 @@ See `app/main.py:10`.
 ### 1. Start modes
 
 #### Real Feishu mode
-Use real Feishu credentials in `.env`. On startup, the service will:
+Use real Feishu credentials in `.env`. On startup, the service will first validate required Feishu config and Gemini CLI availability, then:
 - fetch tenant access token
 - open Feishu WebSocket subscription
 - receive inbound text messages
@@ -151,7 +154,18 @@ Use this after config changes or deploy/restart:
 7. Trigger one natural-language reminder request and confirm `data/schedules.json` updates
 8. If running in Feishu mode, verify reply cards appear in the chat instead of only local fallback storage
 
-### 8. Troubleshooting
+### 8. Startup self-checks
+On startup, the app now fails fast for:
+- missing `FEISHU_APP_ID` / `FEISHU_APP_SECRET`
+- missing or empty `GEMINI_CLI_PATH`
+- configured Gemini CLI not found on `PATH`
+- unusable `WORKSPACE_ROOT` / `DATA_ROOT`
+
+It also emits a warning when `GEMINI_API_KEY` is not set, because Gemini CLI may still work through an existing local login session.
+
+Implementation lives in `app/config.py:53` and is invoked from `app/main.py:12`.
+
+### 9. Troubleshooting
 
 #### Gemini CLI not found
 Symptom:
@@ -190,7 +204,7 @@ Check:
 - task tracking and current status: `specs/task_list.md`
 
 ## Known Gaps
-- no startup self-checks yet
+- startup self-checks exist, but warning/error policy is still minimal and not yet configurable
 - scheduler overlap protection exists, but stale timeout is still hard-coded and there is no richer retry/backoff policy yet
 - operator runbook is kept in this README for now
 - skills extension framework is not implemented yet

@@ -262,7 +262,7 @@
 - 部分完成：改进错误消息和 fallback cards
 - 已完成：为 JSON stores 添加 atomic file writes
 - 已完成：为重叠的 scheduled task runs 添加 lock/skip 逻辑
-- 未完成：添加 required config 的 startup self-checks
+- 已完成：添加 required config 的 startup self-checks
 - 已完成：添加 README 和 operator runbook
 
 ### 依据
@@ -270,8 +270,8 @@
 - 错误消息已有少量处理，如 Gemini CLI 未找到、非零退出：`app/agent/engine.py:54`, `app/agent/engine.py:73`
 - SchedulerStore 已新增 `running` / `started_at` / `run_token` 字段，以及 `claim_task_for_run()`、`complete_task_run()`、`fail_task_run()`，用于防止同一任务重入：`app/scheduler/store.py:47`, `app/scheduler/store.py:70`, `app/scheduler/store.py:99`, `app/scheduler/store.py:134`
 - SchedulerLoop 已在 dispatch 前 claim task，running 任务会被记录为 `skipped`，并支持 stale lock reclaim：`app/scheduler/loop.py:24`, `app/scheduler/loop.py:41`
-- README 已补到 operator runbook 水平，并记录 scheduler overlap 行为、排查要点和验收 checklist：`README.md:59`, `README.md:134`, `README.md:174`
-- 启动自检仍未实现
+- AppConfig 已新增 `run_startup_checks()`，会在启动时校验 Feishu 配置、Gemini CLI 路径与 data/workspace 目录，并在 `GEMINI_API_KEY` 缺失时给出 warning：`app/config.py:53`, `app/main.py:12`
+- README 已补到 operator runbook 水平，并记录 startup self-check、scheduler overlap 行为、排查要点和验收 checklist：`README.md:43`, `README.md:59`, `README.md:154`
 
 ### 阶段结论
 - **部分完成**
@@ -286,13 +286,13 @@
 - 未完成：Phase 10
 
 ## 当前整体开发进展
-项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 真实调用验证、Feishu -> Dispatcher -> Gemini -> Feishu 最小闭环、workspace/persona/memory/scheduler 存储层、Scheduler 的 due-task dispatch 与执行日志闭环，以及 v1 本地命令包装式 tool bridge；本轮已将运行时 `GEMINI_CLI_PATH` 切换为 `gemini`，完成 Gemini 对 memory/scheduler tools 的真实自然语言自主调用验收，并补上 scheduler overlap lock/skip 与 stale lock reclaim，确认重复调度场景下不会重入执行同一任务。
+项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 真实调用验证、Feishu -> Dispatcher -> Gemini -> Feishu 最小闭环、workspace/persona/memory/scheduler 存储层、Scheduler 的 due-task dispatch 与执行日志闭环，以及 v1 本地命令包装式 tool bridge；本轮已将运行时 `GEMINI_CLI_PATH` 切换为 `gemini`，完成 Gemini 对 memory/scheduler tools 的真实自然语言自主调用验收，补上 scheduler overlap lock/skip 与 stale lock reclaim，并加入启动阶段的 required config / CLI / 目录自检，能在服务启动时更早暴露配置问题。
 
 ## 建议下一步优先级
-1. 补 required config 的 startup self-checks
-2. 在真实 Feishu 场景补多轮对话与定时任务验收
-3. 继续完善 fallback cards / 更清晰错误提示
-4. 把 scheduler stale timeout 配置化，并视需要补 richer retry/backoff 策略
+1. 在真实 Feishu 场景补多轮对话与定时任务验收
+2. 继续完善 fallback cards / 更清晰错误提示
+3. 把 scheduler stale timeout 配置化，并视需要补 richer retry/backoff 策略
+4. 优化 startup self-check 的 warning/error 策略与可配置性
 5. 最后再推进 skills 扩展框架
 
 # 下一轮开发待办
@@ -404,14 +404,11 @@
 **目标**：把项目从“开发态”推进到“可日常运行”。
 
 ### 待办
-1. 增加 startup self-checks
-   - Feishu 配置
-   - Gemini CLI 路径
-   - data/workspace 目录
-2. 补 fallback cards / 更清晰错误提示
-3. 将 scheduler stale timeout 配置化
-4. 视需要补充 scheduler retry/backoff 策略
-5. 在真实 Feishu 场景补最基本手工验收 checklist
+1. 补 fallback cards / 更清晰错误提示
+2. 将 scheduler stale timeout 配置化
+3. 视需要补充 scheduler retry/backoff 策略
+4. 在真实 Feishu 场景补最基本手工验收 checklist
+5. 优化 startup self-check 的 warning/error 策略与可配置性
 
 ### 交付标准
 - 服务重启后能恢复状态

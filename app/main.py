@@ -1,3 +1,4 @@
+import logging
 import time
 
 from app.config import AppConfig
@@ -6,10 +7,15 @@ from app.gateway.feishu import FeishuGateway
 from app.scheduler.loop import SchedulerLoop
 from app.utils.logging import configure_logging
 
+logger = logging.getLogger(__name__)
+
 
 def main() -> None:
     config = AppConfig.load()
     configure_logging(config.log_level)
+    startup = config.run_startup_checks()
+    for warning in startup.warnings:
+        logger.warning("Startup check warning: %s", warning)
 
     dispatcher = Dispatcher(config=config)
     gateway = FeishuGateway(config=config, dispatcher=dispatcher)
