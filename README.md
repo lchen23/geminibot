@@ -132,10 +132,12 @@ Definitions live in `app/agent/workspace.py:63` and are backed by:
 - `app/scheduler/tools.py:7`
 
 ### 6. Scheduler operations
-- Scheduler loop starts in a background thread: `app/scheduler/loop.py:27`
-- It polls every `POLL_INTERVAL_SECONDS`: `app/scheduler/loop.py:35`
-- Due tasks are delivered back through dispatcher and then to Feishu: `app/scheduler/loop.py:46`
-- One-time tasks are removed after execution; cron tasks get `next_run_at` recalculated: `app/scheduler/store.py:67`
+- Scheduler loop starts in a background thread: `app/scheduler/loop.py:28`
+- It polls every `POLL_INTERVAL_SECONDS`: `app/scheduler/loop.py:36`
+- Due tasks are claimed before dispatch, so an already-running task is skipped instead of being re-entered: `app/scheduler/loop.py:41`, `app/scheduler/store.py:70`
+- Stale task locks are reclaimed after a fixed timeout (currently 600 seconds): `app/scheduler/loop.py:24`, `app/scheduler/store.py:171`
+- Due tasks are delivered back through dispatcher and then to Feishu: `app/scheduler/loop.py:59`
+- One-time tasks are removed after successful execution; cron tasks get `next_run_at` recalculated; failed tasks release the lock and remain eligible for retry: `app/scheduler/store.py:99`, `app/scheduler/store.py:134`
 
 ### 7. Basic acceptance checklist
 Use this after config changes or deploy/restart:
@@ -175,6 +177,8 @@ Check:
 - `next_run_at` is due
 - service process is still running
 - execution records in `data/schedule_runs.json`
+- whether the task is currently `running=true` and being skipped for overlap protection
+- whether a stale lock should have been reclaimed based on `started_at`
 
 #### Duplicate inbound events
 Check:
@@ -187,6 +191,6 @@ Check:
 
 ## Known Gaps
 - no startup self-checks yet
-- no overlap lock/skip logic for scheduled runs yet
+- scheduler overlap protection exists, but stale timeout is still hard-coded and there is no richer retry/backoff policy yet
 - operator runbook is kept in this README for now
 - skills extension framework is not implemented yet

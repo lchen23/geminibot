@@ -21,6 +21,7 @@ class SchedulerLoop:
         self.deliver_message = deliver_message
         self.store = SchedulerStore(config)
         self.execution_log = JsonListState(config.data_root / "schedule_runs.json")
+        self.lock_stale_after_seconds = 600
         self._thread: threading.Thread | None = None
         self._running = False
 
@@ -45,15 +46,30 @@ class SchedulerLoop:
 
         for task in due_tasks:
             task_id = task.get("id", "unknown")
+            claimed_task = self.store.claim_task_for_run(
+                task_id,
+                run_at=now,
+                stale_after_seconds=self.lock_stale_after_seconds,
+            )
+            if claimed_task is None:
+                logger.info("Skipping scheduled task id=%s because it is already running.", task_id)
+                self._append_execution_log(task=task, status="skipped", run_at=now, error="already_running")
+                continue
+
             logger.info("Dispatching scheduled task id=%s conversation_id=%s", task_id, task.get("conversation_id"))
             try:
-                response = self.dispatcher.dispatch_scheduled_task(task)
-                self.deliver_message(task["chat_id"], response)
-                updated_task = self.store.mark_task_executed(task_id, run_at=now)
-                self._append_execution_log(task=task, status="success", run_at=now, result=updated_task)
+                response = self.dispatcher.dispatch_scheduled_task(claimed_task)
+                self.deliver_message(claimed_task["chat_id"], response)
+                updated_task = self.store.complete_task_run(
+                    task_id,
+                    run_at=now,
+                    run_token=claimed_task["run_token"],
+                )
+                self._append_execution_log(task=claimed_task, status="success", run_at=now, result=updated_task)
                 logger.info("Scheduled task executed id=%s next_run_at=%s", task_id, updated_task.get("next_run_at") if updated_task else None)
             except Exception as exc:
-                self._append_execution_log(task=task, status="failed", run_at=now, error=str(exc))
+                self.store.fail_task_run(task_id, run_token=claimed_task["run_token"])
+                self._append_execution_log(task=claimed_task, status="failed", run_at=now, error=str(exc))
                 logger.exception("Scheduled task failed id=%s", task_id)
 
     def _append_execution_log(
