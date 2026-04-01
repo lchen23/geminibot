@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Callable
 
 from app.config import AppConfig
@@ -39,7 +39,7 @@ class SchedulerLoop:
             time.sleep(self.config.poll_interval_seconds)
 
     def _dispatch_due_tasks(self) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         due_tasks = self.store.get_due_tasks(now=now)
         if not due_tasks:
             return

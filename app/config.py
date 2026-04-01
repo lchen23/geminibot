@@ -4,6 +4,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     from dotenv import load_dotenv
@@ -67,6 +68,10 @@ class AppConfig:
             raise ValueError(f"Workspace root is not available: {self.workspace_root}")
         if not self.data_root.exists() or not self.data_root.is_dir():
             raise ValueError(f"Data root is not available: {self.data_root}")
+        try:
+            ZoneInfo(self.default_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Default timezone is not supported: {self.default_timezone}") from exc
 
         warnings: list[str] = []
         if not self.gemini_api_key:

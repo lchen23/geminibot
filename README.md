@@ -34,11 +34,13 @@ Required runtime fields:
 Startup self-checks now validate these on boot, and also verify that the configured Gemini CLI is available on `PATH` and that `WORKSPACE_ROOT` / `DATA_ROOT` resolve to usable directories.
 
 Important optional fields:
-- `DEFAULT_TIMEZONE` — default schedule timezone
+- `DEFAULT_TIMEZONE` — default schedule timezone, using an IANA zone like `America/Los_Angeles`
 - `WORKSPACE_ROOT` — per-conversation workspace directory
 - `DATA_ROOT` — shared JSON state directory
 - `POLL_INTERVAL_SECONDS` — scheduler polling interval
 - `LOG_LEVEL` — application log level
+
+Scheduler `once` inputs without an explicit offset are interpreted in `DEFAULT_TIMEZONE`, then normalized to UTC for storage and due-time comparison. Startup self-checks also validate that `DEFAULT_TIMEZONE` is a supported IANA timezone.
 
 Current config loading and defaulting live in `app/config.py:30`.
 
@@ -137,10 +139,13 @@ Definitions live in `app/agent/workspace.py:63` and are backed by:
 ### 6. Scheduler operations
 - Scheduler loop starts in a background thread: `app/scheduler/loop.py:28`
 - It polls every `POLL_INTERVAL_SECONDS`: `app/scheduler/loop.py:36`
-- Due tasks are claimed before dispatch, so an already-running task is skipped instead of being re-entered: `app/scheduler/loop.py:41`, `app/scheduler/store.py:70`
-- Stale task locks are reclaimed after a fixed timeout (currently 600 seconds): `app/scheduler/loop.py:24`, `app/scheduler/store.py:171`
+- Due tasks are compared in UTC with timezone-aware timestamps, avoiding naive local-time vs UTC drift: `app/scheduler/loop.py:41`, `app/scheduler/store.py:26`
+- `once` schedules without an explicit offset are interpreted in the configured task/default timezone and stored as UTC timestamps: `app/scheduler/store.py:39`, `app/scheduler/store.py:177`
+- `cron` schedules are evaluated in the task/default timezone and then normalized back to UTC for persistence: `app/scheduler/store.py:188`
+- Due tasks are claimed before dispatch, so an already-running task is skipped instead of being re-entered: `app/scheduler/loop.py:41`, `app/scheduler/store.py:78`
+- Stale task locks are reclaimed after a fixed timeout (currently 600 seconds): `app/scheduler/loop.py:24`, `app/scheduler/store.py:193`
 - Due tasks are delivered back through dispatcher and then to Feishu: `app/scheduler/loop.py:59`
-- One-time tasks are removed after successful execution; cron tasks get `next_run_at` recalculated; failed tasks release the lock and remain eligible for retry: `app/scheduler/store.py:99`, `app/scheduler/store.py:134`
+- One-time tasks are removed after successful execution; cron tasks get `next_run_at` recalculated; failed tasks release the lock and remain eligible for retry: `app/scheduler/store.py:107`, `app/scheduler/store.py:147`
 
 ### 7. Basic acceptance checklist
 Use this after config changes or deploy/restart:
@@ -149,16 +154,18 @@ Use this after config changes or deploy/restart:
 2. Confirm no immediate CLI-not-found error from Gemini adapter
 3. Send `/help` and verify a formatted reply is returned
 4. Send `/remember test memory` and verify workspace `MEMORY.md` changes
-5. Send `/schedule once | 2026-04-02T15:00:00 | test reminder` and verify `data/schedules.json` changes
+5. Send `/schedule once | 2026-04-02T15:00:00 | test reminder` and verify `data/schedules.json` stores a UTC `next_run_at` that matches `DEFAULT_TIMEZONE`
 6. Trigger one natural-language memory request and confirm `tool_audit.jsonl` updates
 7. Trigger one natural-language reminder request and confirm `data/schedules.json` updates
 8. If running in Feishu mode, verify reply cards appear in the chat instead of only local fallback storage
+9. For real Feishu scheduler validation, compare the scheduled local wall-clock time with `data/schedule_runs.json` and allow up to one poll interval of trigger delay
 
 ### 8. Startup self-checks
 On startup, the app now fails fast for:
 - missing `FEISHU_APP_ID` / `FEISHU_APP_SECRET`
 - missing or empty `GEMINI_CLI_PATH`
 - configured Gemini CLI not found on `PATH`
+- unsupported `DEFAULT_TIMEZONE`
 - unusable `WORKSPACE_ROOT` / `DATA_ROOT`
 
 It also emits a warning when `GEMINI_API_KEY` is not set, because Gemini CLI may still work through an existing local login session.

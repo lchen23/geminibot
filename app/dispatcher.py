@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 from app.agent.engine import GeminiAgentEngine, AgentRequest
 from app.config import AppConfig
@@ -73,12 +73,12 @@ class Dispatcher:
     def dispatch_scheduled_task(self, task: dict) -> dict:
         return self.handle(
             IncomingMessage(
-                message_id=f"scheduled-{task['id']}-{datetime.utcnow().timestamp()}",
+                message_id=f"scheduled-{task['id']}-{datetime.now(UTC).timestamp()}",
                 chat_id=task["chat_id"],
                 user_id=task["created_by"],
                 conversation_id=task["conversation_id"],
                 text=task["prompt"],
-                sent_at=datetime.utcnow().isoformat(),
+                sent_at=datetime.now(UTC).isoformat(),
                 source="scheduler",
             )
         )

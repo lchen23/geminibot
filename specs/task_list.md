@@ -270,8 +270,9 @@
 - 错误消息已有少量处理，如 Gemini CLI 未找到、非零退出：`app/agent/engine.py:54`, `app/agent/engine.py:73`
 - SchedulerStore 已新增 `running` / `started_at` / `run_token` 字段，以及 `claim_task_for_run()`、`complete_task_run()`、`fail_task_run()`，用于防止同一任务重入：`app/scheduler/store.py:47`, `app/scheduler/store.py:70`, `app/scheduler/store.py:99`, `app/scheduler/store.py:134`
 - SchedulerLoop 已在 dispatch 前 claim task，running 任务会被记录为 `skipped`，并支持 stale lock reclaim：`app/scheduler/loop.py:24`, `app/scheduler/loop.py:41`
-- AppConfig 已新增 `run_startup_checks()`，会在启动时校验 Feishu 配置、Gemini CLI 路径与 data/workspace 目录，并在 `GEMINI_API_KEY` 缺失时给出 warning：`app/config.py:53`, `app/main.py:12`
-- README 已补到 operator runbook 水平，并记录 startup self-check、scheduler overlap 行为、排查要点和验收 checklist：`README.md:43`, `README.md:59`, `README.md:154`
+- AppConfig 已新增 `run_startup_checks()`，会在启动时校验 Feishu 配置、Gemini CLI 路径、默认时区与 data/workspace 目录，并在 `GEMINI_API_KEY` 缺失时给出 warning：`app/config.py:60`, `app/main.py:12`
+- Scheduler 时间语义已修正：`once`/`cron` 按任务或默认时区解释并统一存为 UTC，due 判断改为 timezone-aware 比较；真实 Feishu 定时验收已通过，未再出现“创建后立即触发”的问题：`app/scheduler/store.py:26`, `app/scheduler/store.py:177`, `app/scheduler/loop.py:42`, `data/schedule_runs.json:39`
+- README 已补到 operator runbook 水平，并记录 startup self-check、scheduler overlap、timezone 语义、排查要点和验收 checklist：`README.md:26`, `README.md:137`, `README.md:157`
 
 ### 阶段结论
 - **部分完成**
@@ -286,13 +287,13 @@
 - 未完成：Phase 10
 
 ## 当前整体开发进展
-项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 真实调用验证、Feishu -> Dispatcher -> Gemini -> Feishu 最小闭环、workspace/persona/memory/scheduler 存储层、Scheduler 的 due-task dispatch 与执行日志闭环，以及 v1 本地命令包装式 tool bridge；本轮已将运行时 `GEMINI_CLI_PATH` 切换为 `gemini`，完成 Gemini 对 memory/scheduler tools 的真实自然语言自主调用验收，补上 scheduler overlap lock/skip 与 stale lock reclaim，并加入启动阶段的 required config / CLI / 目录自检，能在服务启动时更早暴露配置问题。
+项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 真实调用验证、Feishu -> Dispatcher -> Gemini -> Feishu 最小闭环、workspace/persona/memory/scheduler 存储层、Scheduler 的 due-task dispatch 与执行日志闭环，以及 v1 本地命令包装式 tool bridge；本轮已将运行时 `GEMINI_CLI_PATH` 切换为 `gemini`，完成 Gemini 对 memory/scheduler tools 的真实自然语言自主调用验收，补上 scheduler overlap lock/skip 与 stale lock reclaim，并加入启动阶段的 required config / CLI / 默认时区 / 目录自检；同时已修复 scheduler 的时区/时间语义问题，在 `America/Los_Angeles` 配置下完成真实 Feishu 定时验收，确认 once 任务按本地时间正确换算到 UTC 后触发。
 
 ## 建议下一步优先级
-1. 在真实 Feishu 场景补多轮对话与定时任务验收
-2. 继续完善 fallback cards / 更清晰错误提示
-3. 把 scheduler stale timeout 配置化，并视需要补 richer retry/backoff 策略
-4. 优化 startup self-check 的 warning/error 策略与可配置性
+1. 继续完善 fallback cards / 更清晰错误提示
+2. 把 scheduler stale timeout 配置化，并视需要补 richer retry/backoff 策略
+3. 优化 startup self-check 的 warning/error 策略与可配置性
+4. 视需要为旧 scheduler 存量 naive 时间数据补一次迁移
 5. 最后再推进 skills 扩展框架
 
 # 下一轮开发待办
@@ -327,11 +328,13 @@
 ### 当前进展
 - 已完成 due task 轮询、Dispatcher 路由、消息投递、任务状态更新与执行日志落盘
 - 已通过一次到期任务 smoke test，确认任务被消费且写入 `data/schedule_runs.json`
+- 已修复 scheduler 的时区/时间语义，`once`/`cron` 均按默认或任务时区解释并统一存储为 UTC
+- 已在 `America/Los_Angeles` 配置下完成真实 Feishu 一次性 reminder 验收，确认不会再在创建后立即执行：`data/schedule_runs.json:39`
 - 已通过真实 Gemini CLI 自然语言调用创建一次性 reminder，并成功写入 `data/schedules.json`
 
 ### 待办
-1. 在真实 Feishu 场景验证一次性提醒自动投递
-2. 在真实 Feishu 场景验证 cron 任务的 next_run_at 更新
+1. 在真实 Feishu 场景验证 cron 任务的 next_run_at 更新
+2. 视需要为旧 `schedules.json` 中的 naive 时间记录补迁移脚本
 3. 如有需要，补充更细的失败重试/告警策略
 
 ### 交付标准
