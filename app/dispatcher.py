@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Iterator
 
 from app.agent.engine import GeminiAgentEngine, AgentRequest
 from app.config import AppConfig
@@ -20,6 +21,7 @@ class IncomingMessage:
     text: str
     sent_at: str
     source: str = "feishu"
+    chat_type: str | None = None
 
 
 class Dispatcher:
@@ -30,45 +32,39 @@ class Dispatcher:
         self.agent = GeminiAgentEngine(config=config, memory_store=self.memory_store)
 
     def handle(self, message: IncomingMessage) -> dict:
-        text = message.text.strip()
-
-        if text == "/help":
-            reply = self._help_text()
-        elif text == "/clear":
-            reply = self._handle_clear(message.conversation_id)
-        elif text.startswith("/remember "):
-            content = text.removeprefix("/remember ").strip()
-            self.memory_store.save_memory_note(message.conversation_id, content)
-            reply = f"Noted: {content}"
-        elif text == "/tasks":
-            reply = self._format_tasks(self.scheduler_store.list_tasks(chat_id=message.chat_id))
-        elif text.startswith("/schedule "):
-            reply = self._handle_schedule(message, text.removeprefix("/schedule ").strip())
-        elif text.startswith("/delete-task "):
-            task_id = text.removeprefix("/delete-task ").strip()
-            deleted = self.scheduler_store.delete_task(task_id)
-            reply = f"Deleted task: {task_id}" if deleted else f"Task not found: {task_id}"
-        else:
-            result = self.agent.run(
-                AgentRequest(
-                    conversation_id=message.conversation_id,
-                    chat_id=message.chat_id,
-                    user_id=message.user_id,
-                    text=message.text,
-                    source=message.source,
-                )
-            )
-            reply = result.text
-
-        self.memory_store.append_daily_log(
-            conversation_id=message.conversation_id,
-            user_text=message.text,
-            assistant_text=reply,
-        )
+        reply = self._resolve_reply_text(message)
+        self._append_reply_log(message, reply)
         footer = None
         if message.source == "scheduler":
             footer = "Scheduled task"
         return build_markdown_reply(reply, footer=footer)
+
+    def stream_handle(self, message: IncomingMessage) -> Iterator[str]:
+        command_reply = self._resolve_builtin_reply_text(message)
+        if command_reply is not None:
+            self._append_reply_log(message, command_reply)
+            yield command_reply
+            return
+
+        agent_request = AgentRequest(
+            conversation_id=message.conversation_id,
+            chat_id=message.chat_id,
+            user_id=message.user_id,
+            text=message.text,
+            source=message.source,
+        )
+        final_text = ""
+        for event in self.agent.stream(agent_request):
+            if event.error and event.text:
+                final_text = event.text
+            elif event.text:
+                final_text = event.text
+            if event.delta:
+                yield event.text
+        if not final_text:
+            final_text = "Gemini CLI returned no output."
+            yield final_text
+        self._append_reply_log(message, final_text)
 
     def dispatch_scheduled_task(self, task: dict) -> dict:
         return self.handle(
@@ -80,7 +76,51 @@ class Dispatcher:
                 text=task["prompt"],
                 sent_at=datetime.now(UTC).isoformat(),
                 source="scheduler",
+                chat_type="p2p",
             )
+        )
+
+    def _resolve_reply_text(self, message: IncomingMessage) -> str:
+        command_reply = self._resolve_builtin_reply_text(message)
+        if command_reply is not None:
+            return command_reply
+
+        result = self.agent.run(
+            AgentRequest(
+                conversation_id=message.conversation_id,
+                chat_id=message.chat_id,
+                user_id=message.user_id,
+                text=message.text,
+                source=message.source,
+            )
+        )
+        return result.text
+
+    def _resolve_builtin_reply_text(self, message: IncomingMessage) -> str | None:
+        text = message.text.strip()
+        if text == "/help":
+            return self._help_text()
+        if text == "/clear":
+            return self._handle_clear(message.conversation_id)
+        if text.startswith("/remember "):
+            content = text.removeprefix("/remember ").strip()
+            self.memory_store.save_memory_note(message.conversation_id, content)
+            return f"Noted: {content}"
+        if text == "/tasks":
+            return self._format_tasks(self.scheduler_store.list_tasks(chat_id=message.chat_id))
+        if text.startswith("/schedule "):
+            return self._handle_schedule(message, text.removeprefix("/schedule ").strip())
+        if text.startswith("/delete-task "):
+            task_id = text.removeprefix("/delete-task ").strip()
+            deleted = self.scheduler_store.delete_task(task_id)
+            return f"Deleted task: {task_id}" if deleted else f"Task not found: {task_id}"
+        return None
+
+    def _append_reply_log(self, message: IncomingMessage, reply: str) -> None:
+        self.memory_store.append_daily_log(
+            conversation_id=message.conversation_id,
+            user_text=message.text,
+            assistant_text=reply,
         )
 
     def _handle_clear(self, conversation_id: str) -> str:

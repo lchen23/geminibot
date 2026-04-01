@@ -5,6 +5,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from app.agent.session_store import SessionStore
 from app.agent.workspace import WorkspaceManager
@@ -27,6 +28,17 @@ class AgentResult:
     raw_output: str
     session_id: str | None = None
     model: str | None = None
+
+
+@dataclass(slots=True)
+class AgentStreamEvent:
+    delta: str = ""
+    text: str = ""
+    done: bool = False
+    session_id: str | None = None
+    model: str | None = None
+    raw_event: str | None = None
+    error: str | None = None
 
 
 class GeminiAgentEngine:
@@ -81,6 +93,105 @@ class GeminiAgentEngine:
             )
         return parsed
 
+    def stream(self, request: AgentRequest) -> Iterator[AgentStreamEvent]:
+        workspace = self.workspace_manager.ensure_workspace(request.conversation_id)
+        session = self.session_store.get(request.conversation_id)
+        system_prompt = self._build_system_prompt(workspace)
+        self._write_gemini_context_file(workspace, system_prompt)
+        command = self._build_command(request, session, output_format="stream-json")
+        env = self._build_environment(request, workspace)
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=workspace,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+        except FileNotFoundError:
+            yield AgentStreamEvent(
+                text="Gemini CLI was not found. Please install it or configure GEMINI_CLI_PATH.",
+                done=True,
+                error="cli_not_found",
+            )
+            return
+
+        assert process.stdout is not None
+        assert process.stderr is not None
+
+        full_text = ""
+        session_id: str | None = None
+        model: str | None = None
+        raw_events: list[str] = []
+
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                raw_events.append(line)
+                event = self._parse_stream_event(line)
+                if event.session_id:
+                    session_id = event.session_id
+                if event.model:
+                    model = event.model
+                if event.delta:
+                    full_text += event.delta
+                    yield AgentStreamEvent(
+                        delta=event.delta,
+                        text=full_text,
+                        session_id=session_id,
+                        model=model,
+                        raw_event=line,
+                    )
+                if event.done:
+                    break
+        finally:
+            returncode = process.wait()
+            stderr = process.stderr.read().strip()
+
+        if session_id:
+            self.session_store.set(
+                request.conversation_id,
+                {
+                    "session_id": session_id,
+                    "resume": "latest",
+                },
+            )
+
+        if returncode != 0 and not full_text:
+            yield AgentStreamEvent(
+                text=stderr or "Gemini CLI exited with a non-zero status.",
+                done=True,
+                session_id=session_id,
+                model=model,
+                raw_event=self._join_output("\n".join(raw_events), stderr),
+                error="non_zero_exit",
+            )
+            return
+
+        if not full_text:
+            fallback = self._parse_output("\n".join(raw_events), stderr)
+            yield AgentStreamEvent(
+                text=fallback.text,
+                done=True,
+                session_id=fallback.session_id or session_id,
+                model=fallback.model or model,
+                raw_event=fallback.raw_output,
+                error=None if fallback.text else "empty_output",
+            )
+            return
+
+        yield AgentStreamEvent(
+            text=full_text,
+            done=True,
+            session_id=session_id,
+            model=model,
+            raw_event=self._join_output("\n".join(raw_events), stderr),
+        )
+
     def clear_conversation(self, conversation_id: str) -> None:
         self.session_store.delete(conversation_id)
 
@@ -109,13 +220,19 @@ class GeminiAgentEngine:
         elif context_file.exists():
             context_file.unlink()
 
-    def _build_command(self, request: AgentRequest, session: dict | None) -> list[str]:
+    def _build_command(
+        self,
+        request: AgentRequest,
+        session: dict | None,
+        *,
+        output_format: str = "json",
+    ) -> list[str]:
         command = [
             self.config.gemini_cli_path,
             "-p",
             request.text,
             "--output-format",
-            "json",
+            output_format,
         ]
         if session and session.get("resume"):
             command.extend(["--resume", session["resume"]])
@@ -158,6 +275,7 @@ class GeminiAgentEngine:
                 text=error_message,
                 raw_output=raw_output,
                 session_id=data.get("session_id"),
+                model=data.get("model"),
             )
 
         response = data.get("response")
@@ -165,7 +283,35 @@ class GeminiAgentEngine:
             text=response or stderr or json.dumps(data, ensure_ascii=False),
             raw_output=raw_output,
             session_id=data.get("session_id"),
+            model=data.get("model"),
         )
+
+    def _parse_stream_event(self, raw_line: str) -> AgentStreamEvent:
+        try:
+            data = json.loads(raw_line)
+        except json.JSONDecodeError:
+            return AgentStreamEvent(delta=raw_line, raw_event=raw_line)
+
+        event_type = data.get("type")
+        if event_type == "init":
+            return AgentStreamEvent(session_id=data.get("session_id"), model=data.get("model"), raw_event=raw_line)
+        if event_type == "message" and data.get("role") == "assistant":
+            content = data.get("content")
+            if isinstance(content, str):
+                return AgentStreamEvent(delta=content, raw_event=raw_line)
+        if event_type == "result":
+            status = data.get("status")
+            if status != "success":
+                return AgentStreamEvent(done=True, raw_event=raw_line, error=status or "result_error")
+            return AgentStreamEvent(done=True, raw_event=raw_line)
+        if event_type == "error":
+            error = data.get("error")
+            if isinstance(error, dict):
+                message = error.get("message") or json.dumps(error, ensure_ascii=False)
+            else:
+                message = json.dumps(data, ensure_ascii=False)
+            return AgentStreamEvent(text=message, done=True, raw_event=raw_line, error="stream_error")
+        return AgentStreamEvent(raw_event=raw_line)
 
     def _join_output(self, stdout: str, stderr: str) -> str:
         outputs = [part for part in [stdout, stderr] if part]

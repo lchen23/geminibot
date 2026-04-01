@@ -7,16 +7,39 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 from urllib import error, request
+from uuid import uuid4
 
 try:
-    from lark_oapi import EventDispatcherHandler, LogLevel, ws
+    from lark_oapi import Client, EventDispatcherHandler, LogLevel, ws
+    from lark_oapi.api.cardkit.v1 import (
+        ContentCardElementRequest,
+        ContentCardElementRequestBody,
+        CreateCardRequest,
+        CreateCardRequestBody,
+    )
+    from lark_oapi.api.im.v1 import (
+        CreateMessageRequest,
+        CreateMessageRequestBody,
+        ReplyMessageRequest,
+        ReplyMessageRequestBody,
+    )
 except ModuleNotFoundError:  # pragma: no cover - optional runtime fallback
+    Client = None
     EventDispatcherHandler = None
     ws = None
     LogLevel = None
+    CreateCardRequest = None
+    CreateCardRequestBody = None
+    ContentCardElementRequest = None
+    ContentCardElementRequestBody = None
+    CreateMessageRequest = None
+    CreateMessageRequestBody = None
+    ReplyMessageRequest = None
+    ReplyMessageRequestBody = None
 
 from app.config import AppConfig
 from app.dispatcher import Dispatcher, IncomingMessage
+from app.rendering.cards import build_streaming_markdown_card
 from app.utils.state import JsonListState
 
 logger = logging.getLogger(__name__)
@@ -32,6 +55,7 @@ class FeishuGateway:
         self._tenant_token_expires_at = 0.0
         self._ws_client: Any | None = None
         self._ws_thread: threading.Thread | None = None
+        self._client: Any | None = None
 
     def start(self) -> None:
         if not self._has_credentials():
@@ -39,6 +63,8 @@ class FeishuGateway:
             return
 
         self._get_tenant_access_token(force_refresh=True)
+        if Client is not None:
+            self._client = Client.builder().app_id(self.config.feishu_app_id).app_secret(self.config.feishu_app_secret).build()
         self._start_websocket_client()
         logger.info("FeishuGateway initialized Feishu client for app_id=%s", self.config.feishu_app_id)
 
@@ -66,7 +92,17 @@ class FeishuGateway:
             conversation_id=conversation_id,
             text=text,
             sent_at=datetime.now(timezone.utc).isoformat(),
+            chat_type="p2p" if chat_id == conversation_id else "group",
         )
+
+        if self._has_credentials() and self._supports_streaming_cards() and self._client is not None:
+            try:
+                self._stream_reply_to_card(request_message)
+                logger.info("Prepared streaming response for chat_id=%s", chat_id)
+                return None
+            except Exception:
+                logger.exception("Streaming path failed for chat_id=%s; falling back to normal reply", chat_id)
+
         response = self.dispatcher.handle(request_message)
         logger.info("Prepared response for chat_id=%s", chat_id)
         return response
@@ -124,6 +160,136 @@ class FeishuGateway:
         )
         if response_payload.get("code") != 0:
             raise RuntimeError(f"Feishu send failed: {response_payload.get('msg', 'unknown error')}")
+
+    def _supports_streaming_cards(self) -> bool:
+        return all(
+            dependency is not None
+            for dependency in (
+                self._client,
+                CreateCardRequest,
+                CreateCardRequestBody,
+                ContentCardElementRequest,
+                ContentCardElementRequestBody,
+                CreateMessageRequest,
+                CreateMessageRequestBody,
+                ReplyMessageRequest,
+                ReplyMessageRequestBody,
+            )
+        )
+
+    def _stream_reply_to_card(self, message: IncomingMessage) -> dict:
+        element_id = self._build_stream_element_id()
+        card_id = self._create_streaming_card(element_id)
+        self._send_streaming_card_reference(message=message, card_id=card_id)
+
+        sequence = 0
+        latest_text = ""
+        try:
+            for latest_text in self.dispatcher.stream_handle(message):
+                sequence += 1
+                self._update_streaming_card(card_id=card_id, element_id=element_id, content=latest_text, sequence=sequence)
+        except Exception:
+            logger.exception("Streaming reply failed for chat_id=%s", message.chat_id)
+            if not latest_text:
+                latest_text = "Streaming reply failed."
+            try:
+                sequence += 1
+                self._update_streaming_card(card_id=card_id, element_id=element_id, content=latest_text, sequence=sequence)
+            except Exception:
+                logger.exception("Failed to update streaming card after error for chat_id=%s", message.chat_id)
+        return {"type": "streaming_card", "card_id": card_id, "text": latest_text}
+
+    def _build_stream_element_id(self) -> str:
+        return f"s{uuid4().hex[:12]}"
+
+    def _create_streaming_card(self, element_id: str) -> str:
+        if self._client is None:
+            raise RuntimeError("Feishu streaming card client is not initialized")
+        request = (
+            CreateCardRequest.builder()
+            .request_body(
+                CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(
+                    json.dumps(
+                        build_streaming_markdown_card(
+                            "Thinking...",
+                            summary="Thinking...",
+                            element_id=element_id,
+                        ),
+                        ensure_ascii=False,
+                    )
+                )
+                .build()
+            )
+            .build()
+        )
+        response = self._client.cardkit.v1.card.create(request)
+        if not response.success():
+            raise RuntimeError(
+                f"Feishu create card failed: code={response.code}, msg={response.msg}, log_id={response.get_log_id()}"
+            )
+        card_id = getattr(response.data, "card_id", None)
+        if not card_id:
+            raise RuntimeError("Feishu create card failed: card_id missing in response")
+        return card_id
+
+    def _send_streaming_card_reference(self, *, message: IncomingMessage, card_id: str) -> None:
+        if self._client is None:
+            raise RuntimeError("Feishu streaming card client is not initialized")
+        content = json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False)
+        if message.chat_type == "group":
+            request = (
+                ReplyMessageRequest.builder()
+                .message_id(message.message_id)
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type("interactive")
+                    .content(content)
+                    .build()
+                )
+                .build()
+            )
+            response = self._client.im.v1.message.reply(request)
+        else:
+            request = (
+                CreateMessageRequest.builder()
+                .receive_id_type("chat_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(message.chat_id)
+                    .msg_type("interactive")
+                    .content(content)
+                    .build()
+                )
+                .build()
+            )
+            response = self._client.im.v1.chat.create(request)
+        if not response.success():
+            raise RuntimeError(
+                f"Feishu send streaming card failed: code={response.code}, msg={response.msg}, log_id={response.get_log_id()}"
+            )
+
+    def _update_streaming_card(self, *, card_id: str, element_id: str, content: str, sequence: int) -> None:
+        if self._client is None:
+            raise RuntimeError("Feishu streaming card client is not initialized")
+        request = (
+            ContentCardElementRequest.builder()
+            .card_id(card_id)
+            .element_id(element_id)
+            .request_body(
+                ContentCardElementRequestBody.builder()
+                .content(content)
+                .sequence(sequence)
+                .build()
+            )
+            .build()
+        )
+        response = self._client.cardkit.v1.card_element.content(request)
+        if not response.success():
+            raise RuntimeError(
+                f"Feishu update card failed: code={response.code}, msg={response.msg}, log_id={response.get_log_id()}"
+            )
 
     def _start_websocket_client(self) -> None:
         if self._ws_thread and self._ws_thread.is_alive():
