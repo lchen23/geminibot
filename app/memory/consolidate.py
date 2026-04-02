@@ -5,7 +5,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from app.config import AppConfig
@@ -13,6 +13,8 @@ from app.config import AppConfig
 SUMMARY_FALLBACK_PREFIX = "Semantic summary unavailable"
 MAX_SEMANTIC_SUMMARY_BULLETS = 5
 MAX_LONG_TERM_NOTES = 5
+MAX_LOW_CONFIDENCE_SAVED_NOTES = 20
+CONTEXT_NOTE_TTL_DAYS = 7
 MEMORY_SECTIONS = ("User Preferences", "Stable Facts", "Saved Notes")
 SEMANTIC_DEDUPE_SECTIONS = {"User Preferences", "Stable Facts"}
 PREFERENCE_HINTS = (
@@ -42,6 +44,18 @@ STABLE_FACT_HINTS = (
     "memory layer",
     "scheduler",
     "feishu",
+)
+CONTEXT_HINTS = (
+    "currently",
+    "current",
+    "working on",
+    "right now",
+    "this week",
+    "this month",
+    "today",
+    "temporary",
+    "for now",
+    "in progress",
 )
 
 
@@ -85,11 +99,11 @@ def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = Non
     summary_sections: list[str] = []
     memory_file = workspace / "MEMORY.md"
     memory_sections = _read_memory_sections(memory_file)
+    metadata_updates = {name: {} for name in MEMORY_SECTIONS}
     section_seen = {
         name: {_normalize_item(item) for item in items}
         for name, items in memory_sections.items()
     }
-    notes_changed = False
 
     for log_file in sorted(logs_dir.glob("*.md")):
         content = log_file.read_text(encoding="utf-8").strip()
@@ -127,13 +141,25 @@ def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = Non
             if normalized and normalized not in section_seen[target_section]:
                 memory_sections[target_section].append(normalized)
                 section_seen[target_section].add(normalized)
-                notes_changed = True
+                metadata_updates[target_section][normalized] = _build_note_metadata(
+                    normalized,
+                    section_name=target_section,
+                    source=f"summary:{log_file.stem}",
+                )
 
     if summary_sections:
         summary_file.write_text("\n\n".join(summary_sections).rstrip() + "\n", encoding="utf-8")
 
-    if notes_changed:
-        _rewrite_memory_sections(memory_file, memory_sections, config=config, workspace=workspace)
+    if memory_file.exists() or any(items for items in memory_sections.values()):
+        if not memory_file.exists():
+            memory_file.write_text("# Memory\n\n## User Preferences\n\n## Stable Facts\n\n## Saved Notes\n", encoding="utf-8")
+        _rewrite_memory_sections(
+            memory_file,
+            memory_sections,
+            config=config,
+            workspace=workspace,
+            metadata_updates=metadata_updates,
+        )
 
 
 def _generate_semantic_summary(
@@ -303,6 +329,8 @@ def _parse_summary(log_date: str, text: str) -> ParsedSummary | None:
 
 def _classify_long_term_note(note: str) -> str:
     lowered = _normalize_item(note).lower()
+    if _is_context_note(lowered):
+        return "Saved Notes"
     if any(hint in lowered for hint in PREFERENCE_HINTS):
         return "User Preferences"
     if any(hint in lowered for hint in STABLE_FACT_HINTS):
@@ -310,40 +338,74 @@ def _classify_long_term_note(note: str) -> str:
     return "Saved Notes"
 
 
-def _semantic_dedupe_items(
+def _build_note_metadata(
+    note: str,
+    *,
     section_name: str,
-    items: list[str],
+    source: str,
+    created_at: str | None = None,
+) -> dict[str, str]:
+    normalized = _normalize_item(note)
+    return {
+        "created_at": created_at or _now_isoformat(),
+        "source": _normalize_item(source) or "unknown",
+        "kind": _classify_memory_kind(normalized, section_name=section_name, source=source),
+    }
+
+
+def _classify_memory_kind(note: str, *, section_name: str, source: str) -> str:
+    lowered = _normalize_item(note).lower()
+    if _is_context_note(lowered):
+        return "context"
+    if section_name == "User Preferences":
+        return "preference"
+    if section_name == "Stable Facts":
+        return "fact"
+    if source.startswith("summary:"):
+        return "low_confidence"
+    return "note"
+
+
+def _is_context_note(note: str) -> bool:
+    lowered = _normalize_item(note).lower()
+    return any(hint in lowered for hint in CONTEXT_HINTS)
+
+
+def _semantic_dedupe_entries(
+    section_name: str,
+    entries: list[dict[str, str]],
     *,
     config: AppConfig | None,
     workspace: Path | None,
-) -> list[str]:
-    deduped = _exact_dedupe(items)
+) -> list[dict[str, str]]:
+    deduped = _exact_dedupe_entries(entries)
     if section_name not in SEMANTIC_DEDUPE_SECTIONS or len(deduped) < 2 or config is None or workspace is None:
         return deduped
 
-    merged: list[str] = []
-    for item in deduped:
+    merged: list[dict[str, str]] = []
+    for entry in deduped:
         if not merged:
-            merged.append(item)
+            merged.append(entry)
             continue
 
-        decision = _semantic_duplicate_decision(section_name, merged, item, config, workspace)
+        decision = _semantic_duplicate_decision(section_name, [item["content"] for item in merged], entry["content"], config, workspace)
         if decision is None:
-            merged.append(item)
+            merged.append(entry)
             continue
 
         duplicate_of = decision.get("duplicate_of")
-        canonical = _normalize_item(decision.get("canonical") or item)
+        canonical = _normalize_item(decision.get("canonical") or "")
         if duplicate_of is None:
-            merged.append(item)
+            merged.append(entry)
             continue
         if not isinstance(duplicate_of, int) or duplicate_of < 0 or duplicate_of >= len(merged):
-            merged.append(item)
+            merged.append(entry)
             continue
 
-        if canonical:
-            merged[duplicate_of] = canonical
-    return _exact_dedupe(merged)
+        merged_entry = _merge_note_entries(merged[duplicate_of], entry)
+        merged_entry["content"] = canonical or merged_entry["content"]
+        merged[duplicate_of] = merged_entry
+    return _exact_dedupe_entries(merged)
 
 
 def _semantic_duplicate_decision(
@@ -520,16 +582,30 @@ def _rewrite_memory_sections(
     *,
     config: AppConfig | None,
     workspace: Path | None,
+    metadata_updates: dict[str, dict[str, dict[str, str]]] | None = None,
 ) -> None:
     if not memory_file.exists():
         return
 
     original = memory_file.read_text(encoding="utf-8")
+    existing_metadata = _load_memory_metadata(memory_file)
+    fallback_created_at = _file_created_at(memory_file)
+    serialized_metadata: dict[str, list[dict[str, str]]] = {}
+
     lines = ["# Memory", ""]
     for section_name in MEMORY_SECTIONS:
-        items = _semantic_dedupe_items(section_name, sections.get(section_name, []), config=config, workspace=workspace)
+        entries = _build_section_entries(
+            section_name,
+            sections.get(section_name, []),
+            existing_metadata.get(section_name, []),
+            (metadata_updates or {}).get(section_name, {}),
+            fallback_created_at,
+        )
+        entries = _semantic_dedupe_entries(section_name, entries, config=config, workspace=workspace)
+        entries = _apply_retention_policy(section_name, entries)
+        serialized_metadata[section_name] = entries
         lines.append(f"## {section_name}")
-        lines.extend(f"- {item}" for item in items)
+        lines.extend(f"- {entry['content']}" for entry in entries)
         lines.append("")
 
     for section_name, items in _extract_extra_sections(original).items():
@@ -538,6 +614,209 @@ def _rewrite_memory_sections(
         lines.append("")
 
     memory_file.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    _write_memory_metadata(memory_file, serialized_metadata)
+
+
+def _build_section_entries(
+    section_name: str,
+    items: list[str],
+    existing_entries: list[dict[str, str]],
+    metadata_updates: dict[str, dict[str, str]],
+    fallback_created_at: str,
+) -> list[dict[str, str]]:
+    existing_by_content = {
+        _normalize_item(entry.get("content", "")): entry
+        for entry in existing_entries
+        if _normalize_item(entry.get("content", ""))
+    }
+    entries: list[dict[str, str]] = []
+    for item in items:
+        normalized = _normalize_item(item)
+        if not normalized:
+            continue
+        metadata = metadata_updates.get(normalized) or existing_by_content.get(normalized)
+        entries.append(_normalize_note_entry(section_name, normalized, metadata, fallback_created_at))
+    return entries
+
+
+def _normalize_note_entry(
+    section_name: str,
+    content: str,
+    metadata: dict[str, str] | None,
+    fallback_created_at: str,
+) -> dict[str, str]:
+    normalized_content = _normalize_item(content)
+    raw_source = _normalize_item((metadata or {}).get("source", "")) or "legacy"
+    raw_created_at = (metadata or {}).get("created_at") or fallback_created_at
+    created_at = _normalize_timestamp(raw_created_at) or fallback_created_at
+    kind = _normalize_item((metadata or {}).get("kind", "")) or _classify_memory_kind(
+        normalized_content,
+        section_name=section_name,
+        source=raw_source,
+    )
+    return {
+        "content": normalized_content,
+        "created_at": created_at,
+        "source": raw_source,
+        "kind": kind,
+    }
+
+
+def _apply_retention_policy(section_name: str, entries: list[dict[str, str]]) -> list[dict[str, str]]:
+    retained = [entry for entry in entries if not _should_drop_entry(entry)]
+    if section_name != "Saved Notes":
+        return retained
+
+    low_confidence = [entry for entry in retained if entry["kind"] == "low_confidence"]
+    if len(low_confidence) <= MAX_LOW_CONFIDENCE_SAVED_NOTES:
+        return retained
+
+    keep_contents = {
+        entry["content"]
+        for entry in sorted(low_confidence, key=_entry_sort_key, reverse=True)[:MAX_LOW_CONFIDENCE_SAVED_NOTES]
+    }
+    return [
+        entry
+        for entry in retained
+        if entry["kind"] != "low_confidence" or entry["content"] in keep_contents
+    ]
+
+
+def _should_drop_entry(entry: dict[str, str]) -> bool:
+    if entry.get("kind") != "context":
+        return False
+    created_at = _parse_timestamp(entry.get("created_at", ""))
+    if created_at is None:
+        return False
+    return created_at < datetime.now(timezone.utc) - timedelta(days=CONTEXT_NOTE_TTL_DAYS)
+
+
+def _entry_sort_key(entry: dict[str, str]) -> datetime:
+    return _parse_timestamp(entry.get("created_at", "")) or datetime.fromtimestamp(0, tz=timezone.utc)
+
+
+def _merge_note_entries(existing: dict[str, str], candidate: dict[str, str]) -> dict[str, str]:
+    merged = dict(existing)
+    if _entry_sort_key(candidate) >= _entry_sort_key(existing):
+        merged["created_at"] = candidate["created_at"]
+        if candidate.get("source") and candidate["source"] != "legacy":
+            merged["source"] = candidate["source"]
+    if merged.get("kind") in {"legacy", "note"} and candidate.get("kind"):
+        merged["kind"] = candidate["kind"]
+    return merged
+
+
+def _exact_dedupe_entries(entries: list[dict[str, str]]) -> list[dict[str, str]]:
+    deduped: list[dict[str, str]] = []
+    seen: dict[str, int] = {}
+    for entry in entries:
+        content = _normalize_item(entry.get("content", ""))
+        if not content:
+            continue
+        normalized_entry = dict(entry)
+        normalized_entry["content"] = content
+        index = seen.get(content)
+        if index is None:
+            seen[content] = len(deduped)
+            deduped.append(normalized_entry)
+            continue
+        deduped[index] = _merge_note_entries(deduped[index], normalized_entry)
+    return deduped
+
+
+def _metadata_file(memory_file: Path) -> Path:
+    return memory_file.with_name("MEMORY.meta.json")
+
+
+def _load_memory_metadata(memory_file: Path) -> dict[str, list[dict[str, str]]]:
+    metadata_file = _metadata_file(memory_file)
+    if not metadata_file.exists():
+        return {name: [] for name in MEMORY_SECTIONS}
+
+    try:
+        payload = json.loads(metadata_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {name: [] for name in MEMORY_SECTIONS}
+
+    if not isinstance(payload, dict):
+        return {name: [] for name in MEMORY_SECTIONS}
+
+    sections = payload.get("sections")
+    if not isinstance(sections, dict):
+        return {name: [] for name in MEMORY_SECTIONS}
+
+    loaded: dict[str, list[dict[str, str]]] = {name: [] for name in MEMORY_SECTIONS}
+    for section_name in MEMORY_SECTIONS:
+        raw_entries = sections.get(section_name, [])
+        if not isinstance(raw_entries, list):
+            continue
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict):
+                continue
+            content = _normalize_item(str(raw_entry.get("content", "")))
+            if not content:
+                continue
+            loaded[section_name].append(
+                {
+                    "content": content,
+                    "created_at": str(raw_entry.get("created_at", "")),
+                    "source": _normalize_item(str(raw_entry.get("source", ""))),
+                    "kind": _normalize_item(str(raw_entry.get("kind", ""))),
+                }
+            )
+    return loaded
+
+
+def _write_memory_metadata(memory_file: Path, sections: dict[str, list[dict[str, str]]]) -> None:
+    payload = {
+        "version": 1,
+        "sections": {
+            section_name: [
+                {
+                    "content": entry["content"],
+                    "created_at": entry["created_at"],
+                    "source": entry["source"],
+                    "kind": entry["kind"],
+                }
+                for entry in entries
+            ]
+            for section_name, entries in sections.items()
+        },
+    }
+    _metadata_file(memory_file).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _file_created_at(path: Path) -> str:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
+    except OSError:
+        return _now_isoformat()
+
+
+def _now_isoformat() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _normalize_timestamp(value: str) -> str | None:
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return None
+    return parsed.isoformat(timespec="seconds")
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _extract_extra_sections(text: str) -> dict[str, list[str]]:

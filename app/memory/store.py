@@ -4,7 +4,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from app.config import AppConfig
-from app.memory.consolidate import _classify_long_term_note, _rewrite_memory_sections
+from app.memory.consolidate import _build_note_metadata, _classify_long_term_note, _rewrite_memory_sections
 
 REQUIRED_MEMORY_SECTIONS = (
     "User Preferences",
@@ -49,7 +49,15 @@ class MemoryStore:
         existing = {self._normalize_item(item) for item in sections[target_section]}
         if cleaned not in existing:
             sections[target_section].append(cleaned)
-            self._write_memory_sections(conversation_id, sections)
+            metadata_updates = {
+                name: {} for name in REQUIRED_MEMORY_SECTIONS
+            }
+            metadata_updates[target_section][cleaned] = _build_note_metadata(
+                cleaned,
+                section_name=target_section,
+                source="remember",
+            )
+            self._write_memory_sections(conversation_id, sections, metadata_updates=metadata_updates)
 
     def read_memory(self, conversation_id: str) -> str:
         memory_file = self.get_workspace(conversation_id) / "MEMORY.md"
@@ -68,7 +76,16 @@ class MemoryStore:
             seen.add(cleaned)
             deduped.append(cleaned)
         sections["Saved Notes"] = deduped
-        self._write_memory_sections(conversation_id, sections)
+        metadata_updates = {
+            name: {} for name in REQUIRED_MEMORY_SECTIONS
+        }
+        for item in deduped:
+            metadata_updates["Saved Notes"][item] = _build_note_metadata(
+                item,
+                section_name="Saved Notes",
+                source="rewrite",
+            )
+        self._write_memory_sections(conversation_id, sections, metadata_updates=metadata_updates)
 
     def write_summary(self, conversation_id: str, summary_date: date, content: str) -> Path:
         workspace = self.get_workspace(conversation_id)
@@ -136,12 +153,23 @@ class MemoryStore:
         text = self.read_memory(conversation_id)
         return self._parse_memory_sections(text)
 
-    def _write_memory_sections(self, conversation_id: str, sections: dict[str, list[str]]) -> None:
+    def _write_memory_sections(
+        self,
+        conversation_id: str,
+        sections: dict[str, list[str]],
+        metadata_updates: dict[str, dict[str, dict[str, str]]] | None = None,
+    ) -> None:
         workspace = self.get_workspace(conversation_id)
         memory_file = workspace / "MEMORY.md"
         if not memory_file.exists():
             memory_file.write_text(self._serialize_memory_sections(self._default_memory_sections()), encoding="utf-8")
-        _rewrite_memory_sections(memory_file, sections, config=self.config, workspace=workspace)
+        _rewrite_memory_sections(
+            memory_file,
+            sections,
+            config=self.config,
+            workspace=workspace,
+            metadata_updates=metadata_updates,
+        )
 
     def _default_memory_sections(self) -> dict[str, list[str]]:
         return {name: list(items) for name, items in DEFAULT_MEMORY_ITEMS.items()}
