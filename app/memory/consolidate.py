@@ -17,7 +17,9 @@ MAX_LOW_CONFIDENCE_SAVED_NOTES = 20
 CONTEXT_NOTE_TTL_DAYS = 7
 MEMORY_SECTIONS = ("User Preferences", "Stable Facts", "Saved Notes")
 SEMANTIC_DEDUPE_SECTIONS = {"User Preferences", "Stable Facts"}
-PREFERENCE_HINTS = (
+MEMORY_KINDS = {"preference", "fact", "context", "low_confidence", "note"}
+DEFAULT_CONFIDENCE = 0.5
+PREFERENCE_FALLBACK_HINTS = (
     "prefer",
     "prefers",
     "like",
@@ -32,7 +34,7 @@ PREFERENCE_HINTS = (
     "concise",
     "practical",
 )
-STABLE_FACT_HINTS = (
+STABLE_FACT_FALLBACK_HINTS = (
     "geminibot",
     "project",
     "repo",
@@ -45,7 +47,7 @@ STABLE_FACT_HINTS = (
     "scheduler",
     "feishu",
 )
-CONTEXT_HINTS = (
+CONTEXT_FALLBACK_HINTS = (
     "currently",
     "current",
     "working on",
@@ -57,6 +59,14 @@ CONTEXT_HINTS = (
     "for now",
     "in progress",
 )
+
+
+@dataclass(slots=True)
+class NoteClassification:
+    section: str
+    kind: str
+    confidence: float
+    ttl_days: int | None
 
 
 @dataclass(slots=True)
@@ -136,14 +146,22 @@ def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = Non
 
         summary_sections.append(parsed.to_markdown())
         for candidate in parsed.potential_long_term_notes[:MAX_LONG_TERM_NOTES]:
-            target_section = _classify_long_term_note(candidate)
             normalized = _normalize_item(candidate)
+            if not normalized:
+                continue
+            classification = _classify_note_semantics(
+                normalized,
+                source=f"summary:{log_file.stem}",
+                config=config,
+                workspace=workspace,
+            )
+            target_section = classification.section
             if normalized and normalized not in section_seen[target_section]:
                 memory_sections[target_section].append(normalized)
                 section_seen[target_section].add(normalized)
                 metadata_updates[target_section][normalized] = _build_note_metadata(
                     normalized,
-                    section_name=target_section,
+                    classification=classification,
                     source=f"summary:{log_file.stem}",
                 )
 
@@ -327,48 +345,235 @@ def _parse_summary(log_date: str, text: str) -> ParsedSummary | None:
     )
 
 
-def _classify_long_term_note(note: str) -> str:
-    lowered = _normalize_item(note).lower()
-    if _is_context_note(lowered):
-        return "Saved Notes"
-    if any(hint in lowered for hint in PREFERENCE_HINTS):
-        return "User Preferences"
-    if any(hint in lowered for hint in STABLE_FACT_HINTS):
-        return "Stable Facts"
-    return "Saved Notes"
+def _classify_long_term_note(
+    note: str,
+    *,
+    source: str = "unknown",
+    config: AppConfig | None = None,
+    workspace: Path | None = None,
+) -> NoteClassification:
+    return _classify_note_semantics(note, source=source, config=config, workspace=workspace)
 
 
 def _build_note_metadata(
     note: str,
     *,
-    section_name: str,
+    classification: NoteClassification | None = None,
+    section_name: str | None = None,
     source: str,
     created_at: str | None = None,
 ) -> dict[str, str]:
     normalized = _normalize_item(note)
+    normalized_source = _normalize_item(source) or "unknown"
+    resolved_classification = classification or _classify_note_semantics(
+        normalized,
+        source=normalized_source,
+        fallback_section=section_name,
+    )
     return {
         "created_at": created_at or _now_isoformat(),
-        "source": _normalize_item(source) or "unknown",
-        "kind": _classify_memory_kind(normalized, section_name=section_name, source=source),
+        "source": normalized_source,
+        "section": resolved_classification.section,
+        "kind": resolved_classification.kind,
+        "confidence": _format_confidence(resolved_classification.confidence),
+        "ttl_days": "" if resolved_classification.ttl_days is None else str(resolved_classification.ttl_days),
     }
 
 
-def _classify_memory_kind(note: str, *, section_name: str, source: str) -> str:
+def _classify_memory_kind(
+    note: str,
+    *,
+    section_name: str,
+    source: str,
+    config: AppConfig | None = None,
+    workspace: Path | None = None,
+) -> str:
+    return _classify_note_semantics(
+        note,
+        source=source,
+        fallback_section=section_name,
+        config=config,
+        workspace=workspace,
+    ).kind
+
+
+def _classify_note_semantics(
+    note: str,
+    *,
+    source: str,
+    fallback_section: str | None = None,
+    config: AppConfig | None = None,
+    workspace: Path | None = None,
+) -> NoteClassification:
+    normalized = _normalize_item(note)
+    if not normalized:
+        return NoteClassification(
+            section=fallback_section if fallback_section in MEMORY_SECTIONS else "Saved Notes",
+            kind="low_confidence",
+            confidence=0.0,
+            ttl_days=None,
+        )
+
+    decision = _semantic_note_classification_decision(normalized, source=source, config=config, workspace=workspace)
+    if decision is not None:
+        return decision
+    return _fallback_note_classification(normalized, source=source, fallback_section=fallback_section)
+
+
+def _semantic_note_classification_decision(
+    note: str,
+    *,
+    source: str,
+    config: AppConfig | None,
+    workspace: Path | None,
+) -> NoteClassification | None:
+    if config is None or workspace is None:
+        return None
+
+    cli_path = config.selected_cli_path.strip()
+    if not cli_path or shutil.which(cli_path) is None:
+        return None
+
+    prompt = _build_note_classification_prompt(note, source)
+    command = [cli_path, "-p", prompt, "--output-format", "json"]
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_build_cli_environment(config, workspace),
+        )
+    except OSError:
+        return None
+
+    text = _extract_cli_text(config.ai_provider, completed.stdout.strip(), completed.stderr.strip())
+    if completed.returncode != 0 or not text:
+        return None
+
+    return _parse_note_classification(text, source=source)
+
+
+def _build_note_classification_prompt(note: str, source: str) -> str:
+    note_json = json.dumps(note, ensure_ascii=False)
+    source_json = json.dumps(_normalize_item(source) or "unknown", ensure_ascii=False)
+    return f"""You are classifying a candidate long-term memory note for workspace memory.
+
+Return JSON only with this schema:
+{{
+  \"section\": \"User Preferences\" | \"Stable Facts\" | \"Saved Notes\",
+  \"kind\": \"preference\" | \"fact\" | \"context\" | \"low_confidence\" | \"note\",
+  \"confidence\": <number between 0 and 1>,
+  \"ttl_days\": <integer or null>
+}}
+
+Classification rules:
+- User Preferences: durable user preferences, styles, dislikes, or recurring ways of working.
+- Stable Facts: durable facts, constraints, architecture facts, or project truths likely to remain useful.
+- Saved Notes: ambiguous, weaker, or general notes that are still worth saving.
+- kind=context only for time-bound or temporary context that should expire.
+- kind=preference must use section User Preferences.
+- kind=fact must use section Stable Facts.
+- kind=context, kind=low_confidence, and kind=note must use section Saved Notes.
+- Use ttl_days=7 for short-lived context. Otherwise use null.
+- Use low_confidence when the statement might be useful but wording is ambiguous or weakly grounded.
+- Prefer semantic meaning over keyword matches.
+- Be conservative: if unsure, choose Saved Notes with kind=low_confidence.
+
+Source:
+{source_json}
+
+Note:
+{note_json}
+"""
+
+
+def _parse_note_classification(text: str, *, source: str) -> NoteClassification | None:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = [line for line in cleaned.splitlines() if not line.startswith("```")]
+        cleaned = "\n".join(lines).strip()
+
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    section = _normalize_item(str(payload.get("section", "")))
+    kind = _normalize_item(str(payload.get("kind", ""))).lower()
+    confidence = _coerce_confidence(payload.get("confidence"))
+    ttl_days = _coerce_ttl_days(payload.get("ttl_days"))
+
+    if section not in MEMORY_SECTIONS or kind not in MEMORY_KINDS or confidence is None:
+        return None
+    if kind == "preference" and section != "User Preferences":
+        return None
+    if kind == "fact" and section != "Stable Facts":
+        return None
+    if kind in {"context", "low_confidence", "note"} and section != "Saved Notes":
+        return None
+    if kind == "context" and ttl_days is None:
+        ttl_days = CONTEXT_NOTE_TTL_DAYS
+    if kind != "context" and ttl_days is not None:
+        ttl_days = None
+
+    if source.startswith("summary:") and kind == "note" and confidence < 0.6:
+        kind = "low_confidence"
+
+    return NoteClassification(
+        section=section,
+        kind=kind,
+        confidence=confidence,
+        ttl_days=ttl_days,
+    )
+
+
+def _fallback_note_classification(note: str, *, source: str, fallback_section: str | None) -> NoteClassification:
     lowered = _normalize_item(note).lower()
     if _is_context_note(lowered):
-        return "context"
-    if section_name == "User Preferences":
-        return "preference"
-    if section_name == "Stable Facts":
-        return "fact"
+        return NoteClassification(
+            section="Saved Notes",
+            kind="context",
+            confidence=0.65,
+            ttl_days=CONTEXT_NOTE_TTL_DAYS,
+        )
+    if any(hint in lowered for hint in PREFERENCE_FALLBACK_HINTS):
+        return NoteClassification(
+            section="User Preferences",
+            kind="preference",
+            confidence=0.7,
+            ttl_days=None,
+        )
+    if any(hint in lowered for hint in STABLE_FACT_FALLBACK_HINTS):
+        return NoteClassification(
+            section="Stable Facts",
+            kind="fact",
+            confidence=0.68,
+            ttl_days=None,
+        )
+
     if source.startswith("summary:"):
-        return "low_confidence"
-    return "note"
+        return NoteClassification(
+            section="Saved Notes",
+            kind="low_confidence",
+            confidence=0.45,
+            ttl_days=None,
+        )
+
+    if fallback_section == "User Preferences":
+        return NoteClassification(section="User Preferences", kind="preference", confidence=0.55, ttl_days=None)
+    if fallback_section == "Stable Facts":
+        return NoteClassification(section="Stable Facts", kind="fact", confidence=0.55, ttl_days=None)
+    return NoteClassification(section="Saved Notes", kind="note", confidence=DEFAULT_CONFIDENCE, ttl_days=None)
 
 
 def _is_context_note(note: str) -> bool:
     lowered = _normalize_item(note).lower()
-    return any(hint in lowered for hint in CONTEXT_HINTS)
+    return any(hint in lowered for hint in CONTEXT_FALLBACK_HINTS)
 
 
 def _semantic_dedupe_entries(
@@ -649,16 +854,37 @@ def _normalize_note_entry(
     raw_source = _normalize_item((metadata or {}).get("source", "")) or "legacy"
     raw_created_at = (metadata or {}).get("created_at") or fallback_created_at
     created_at = _normalize_timestamp(raw_created_at) or fallback_created_at
-    kind = _normalize_item((metadata or {}).get("kind", "")) or _classify_memory_kind(
-        normalized_content,
-        section_name=section_name,
-        source=raw_source,
-    )
+    section = _normalize_item((metadata or {}).get("section", "")) or section_name
+    kind = _normalize_item((metadata or {}).get("kind", ""))
+    confidence = _normalize_confidence((metadata or {}).get("confidence", ""))
+    ttl_days = _normalize_ttl_days((metadata or {}).get("ttl_days", ""))
+
+    if section not in MEMORY_SECTIONS or kind not in MEMORY_KINDS or confidence is None:
+        classification = _classify_note_semantics(
+            normalized_content,
+            source=raw_source,
+            fallback_section=section_name,
+        )
+        section = classification.section
+        kind = classification.kind
+        confidence = classification.confidence
+        ttl_days = classification.ttl_days
+
+    if section != section_name:
+        section = section_name
+    if kind == "context" and ttl_days is None:
+        ttl_days = CONTEXT_NOTE_TTL_DAYS
+    if kind != "context":
+        ttl_days = None
+
     return {
         "content": normalized_content,
         "created_at": created_at,
         "source": raw_source,
+        "section": section,
         "kind": kind,
+        "confidence": _format_confidence(confidence),
+        "ttl_days": "" if ttl_days is None else str(ttl_days),
     }
 
 
@@ -686,9 +912,10 @@ def _should_drop_entry(entry: dict[str, str]) -> bool:
     if entry.get("kind") != "context":
         return False
     created_at = _parse_timestamp(entry.get("created_at", ""))
+    ttl_days = _normalize_ttl_days(entry.get("ttl_days", "")) or CONTEXT_NOTE_TTL_DAYS
     if created_at is None:
         return False
-    return created_at < datetime.now(timezone.utc) - timedelta(days=CONTEXT_NOTE_TTL_DAYS)
+    return created_at < datetime.now(timezone.utc) - timedelta(days=ttl_days)
 
 
 def _entry_sort_key(entry: dict[str, str]) -> datetime:
@@ -701,8 +928,16 @@ def _merge_note_entries(existing: dict[str, str], candidate: dict[str, str]) -> 
         merged["created_at"] = candidate["created_at"]
         if candidate.get("source") and candidate["source"] != "legacy":
             merged["source"] = candidate["source"]
-    if merged.get("kind") in {"legacy", "note"} and candidate.get("kind"):
+    if merged.get("kind") in {"legacy", "note", "low_confidence"} and candidate.get("kind"):
         merged["kind"] = candidate["kind"]
+    merged_confidence = _normalize_confidence(merged.get("confidence", ""))
+    candidate_confidence = _normalize_confidence(candidate.get("confidence", ""))
+    if candidate_confidence is not None and (merged_confidence is None or candidate_confidence >= merged_confidence):
+        merged["confidence"] = _format_confidence(candidate_confidence)
+        merged["section"] = candidate.get("section", merged.get("section", "Saved Notes"))
+        merged["ttl_days"] = candidate.get("ttl_days", merged.get("ttl_days", ""))
+    elif merged_confidence is not None:
+        merged["confidence"] = _format_confidence(merged_confidence)
     return merged
 
 
@@ -761,7 +996,10 @@ def _load_memory_metadata(memory_file: Path) -> dict[str, list[dict[str, str]]]:
                     "content": content,
                     "created_at": str(raw_entry.get("created_at", "")),
                     "source": _normalize_item(str(raw_entry.get("source", ""))),
+                    "section": _normalize_item(str(raw_entry.get("section", ""))),
                     "kind": _normalize_item(str(raw_entry.get("kind", ""))),
+                    "confidence": _normalize_item(str(raw_entry.get("confidence", ""))),
+                    "ttl_days": _normalize_item(str(raw_entry.get("ttl_days", ""))),
                 }
             )
     return loaded
@@ -776,7 +1014,10 @@ def _write_memory_metadata(memory_file: Path, sections: dict[str, list[dict[str,
                     "content": entry["content"],
                     "created_at": entry["created_at"],
                     "source": entry["source"],
+                    "section": entry.get("section", section_name),
                     "kind": entry["kind"],
+                    "confidence": entry.get("confidence", _format_confidence(DEFAULT_CONFIDENCE)),
+                    "ttl_days": entry.get("ttl_days", ""),
                 }
                 for entry in entries
             ]
@@ -802,6 +1043,65 @@ def _normalize_timestamp(value: str) -> str | None:
     if parsed is None:
         return None
     return parsed.isoformat(timespec="seconds")
+
+
+def _coerce_confidence(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+    elif isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        try:
+            numeric = float(cleaned)
+        except ValueError:
+            return None
+    else:
+        return None
+    if numeric < 0 or numeric > 1:
+        return None
+    return numeric
+
+
+def _normalize_confidence(value: object) -> float | None:
+    return _coerce_confidence(value)
+
+
+def _format_confidence(value: float) -> str:
+    bounded = min(max(value, 0.0), 1.0)
+    return f"{bounded:.3f}".rstrip("0").rstrip(".") or "0"
+
+
+def _coerce_ttl_days(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        ttl_days = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            return None
+        ttl_days = int(value)
+    elif isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        try:
+            ttl_days = int(cleaned)
+        except ValueError:
+            return None
+    else:
+        return None
+    if ttl_days <= 0:
+        return None
+    return ttl_days
+
+
+def _normalize_ttl_days(value: object) -> int | None:
+    return _coerce_ttl_days(value)
 
 
 def _parse_timestamp(value: str) -> datetime | None:

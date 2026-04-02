@@ -53,6 +53,9 @@ SOURCE_RELEVANCE_BOOSTS = {
 }
 RECENCY_MAX_DAYS = 30
 RECENCY_MAX_BOOST = 20
+CONFIDENCE_MAX_BOOST = 20
+TTL_MAX_BOOST = 15
+TTL_EXPIRED_PENALTY = -40
 
 
 @dataclass(slots=True)
@@ -84,7 +87,14 @@ class MemoryStore:
         cleaned = self._normalize_item(content)
         if not cleaned:
             return
-        target_section = _classify_long_term_note(cleaned)
+        workspace = self.get_workspace(conversation_id)
+        classification = _classify_long_term_note(
+            cleaned,
+            source="remember",
+            config=self.config,
+            workspace=workspace,
+        )
+        target_section = classification.section
         existing = {self._normalize_item(item) for item in sections[target_section]}
         if cleaned not in existing:
             sections[target_section].append(cleaned)
@@ -93,7 +103,7 @@ class MemoryStore:
             }
             metadata_updates[target_section][cleaned] = _build_note_metadata(
                 cleaned,
-                section_name=target_section,
+                classification=classification,
                 source="remember",
             )
             self._write_memory_sections(conversation_id, sections, metadata_updates=metadata_updates)
@@ -106,22 +116,34 @@ class MemoryStore:
 
     def rewrite_memory(self, conversation_id: str, lines: list[str]) -> None:
         sections = self._read_memory_sections(conversation_id)
-        deduped: list[str] = []
-        seen: set[str] = set()
-        for line in lines:
-            cleaned = self._normalize_item(line)
-            if not cleaned or cleaned in seen:
-                continue
-            seen.add(cleaned)
-            deduped.append(cleaned)
-        sections["Saved Notes"] = deduped
+        sections["Saved Notes"] = []
+        seen_by_section = {
+            name: {self._normalize_item(item) for item in sections.get(name, [])}
+            for name in REQUIRED_MEMORY_SECTIONS
+        }
         metadata_updates = {
             name: {} for name in REQUIRED_MEMORY_SECTIONS
         }
-        for item in deduped:
-            metadata_updates["Saved Notes"][item] = _build_note_metadata(
-                item,
-                section_name="Saved Notes",
+        workspace = self.get_workspace(conversation_id)
+
+        for line in lines:
+            cleaned = self._normalize_item(line)
+            if not cleaned:
+                continue
+            classification = _classify_long_term_note(
+                cleaned,
+                source="rewrite",
+                config=self.config,
+                workspace=workspace,
+            )
+            target_section = classification.section
+            if cleaned in seen_by_section[target_section]:
+                continue
+            seen_by_section[target_section].add(cleaned)
+            sections[target_section].append(cleaned)
+            metadata_updates[target_section][cleaned] = _build_note_metadata(
+                cleaned,
+                classification=classification,
                 source="rewrite",
             )
         self._write_memory_sections(conversation_id, sections, metadata_updates=metadata_updates)
@@ -390,8 +412,42 @@ class MemoryStore:
         else:
             score += SOURCE_RELEVANCE_BOOSTS.get(source, 0)
 
+        score += self._confidence_boost(metadata.get("confidence", ""))
+        score += self._ttl_boost(metadata)
         score += self._recency_boost(metadata.get("created_at", ""))
         return score
+
+    def _confidence_boost(self, confidence: str) -> int:
+        try:
+            value = float(self._normalize_item(confidence))
+        except ValueError:
+            return 0
+        bounded = min(max(value, 0.0), 1.0)
+        return int(round(bounded * CONFIDENCE_MAX_BOOST))
+
+    def _ttl_boost(self, metadata: dict[str, str]) -> int:
+        kind = self._normalize_item(metadata.get("kind", "")).lower()
+        if kind != "context":
+            return 0
+
+        ttl_days = self._parse_positive_int(metadata.get("ttl_days", ""))
+        if ttl_days is None:
+            return 0
+
+        created_at = _parse_timestamp(metadata.get("created_at", ""))
+        if created_at is None:
+            return 0
+
+        age = datetime.now(timezone.utc) - created_at
+        if age.total_seconds() < 0:
+            return TTL_MAX_BOOST
+
+        age_days = age.total_seconds() / 86400
+        if age_days >= ttl_days:
+            return TTL_EXPIRED_PENALTY
+
+        freshness = 1 - (age_days / ttl_days)
+        return max(0, int(round(freshness * TTL_MAX_BOOST)))
 
     def _recency_boost(self, created_at: str) -> int:
         parsed = _parse_timestamp(created_at)
@@ -408,6 +464,16 @@ class MemoryStore:
 
         freshness = 1 - (age_days / RECENCY_MAX_DAYS)
         return max(0, int(round(freshness * RECENCY_MAX_BOOST)))
+
+    def _parse_positive_int(self, value: str) -> int | None:
+        normalized = self._normalize_item(value)
+        if not normalized:
+            return None
+        try:
+            parsed = int(normalized)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
 
     def _normalize_item(self, value: str) -> str:
         return " ".join(value.strip().split())
