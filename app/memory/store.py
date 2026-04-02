@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from app.config import AppConfig
-from app.memory.consolidate import _build_note_metadata, _classify_long_term_note, _rewrite_memory_sections
+from app.memory.consolidate import (
+    _build_note_metadata,
+    _classify_long_term_note,
+    _load_memory_metadata,
+    _parse_timestamp,
+    _rewrite_memory_sections,
+)
 
 REQUIRED_MEMORY_SECTIONS = (
     "User Preferences",
@@ -27,13 +33,26 @@ LAYER_SUMMARY = "summary"
 LAYER_LOG = "log"
 HIGH_PRIORITY_SUMMARY_HEADINGS = {"### Semantic Summary", "### Potential Long-Term Notes"}
 SECTION_RELEVANCE_BOOSTS = {
-    "User Preferences": 80,
-    "Stable Facts": 70,
-    "Saved Notes": 90,
+    "User Preferences": 90,
+    "Stable Facts": 85,
+    "Saved Notes": 80,
 }
 SUMMARY_RELEVANCE_BOOST = 75
 LOG_RELEVANCE_BOOST = 10
 MAX_LOG_RESULTS_WHEN_HIGHER_LAYERS_HIT = 2
+KIND_RELEVANCE_BOOSTS = {
+    "preference": 35,
+    "fact": 30,
+    "note": 10,
+    "context": 5,
+    "low_confidence": -25,
+}
+SOURCE_RELEVANCE_BOOSTS = {
+    "remember": 20,
+    "rewrite": 10,
+}
+RECENCY_MAX_DAYS = 30
+RECENCY_MAX_BOOST = 20
 
 
 @dataclass(slots=True)
@@ -164,6 +183,16 @@ class MemoryStore:
         if not memory_file.exists():
             return []
 
+        metadata = _load_memory_metadata(memory_file)
+        metadata_by_section = {
+            section_name: {
+                self._normalize_item(entry.get("content", "")): entry
+                for entry in entries
+                if self._normalize_item(entry.get("content", ""))
+            }
+            for section_name, entries in metadata.items()
+        }
+
         hits: list[SearchHit] = []
         current_section = ""
         relative_name = memory_file.relative_to(workspace).as_posix()
@@ -179,10 +208,11 @@ class MemoryStore:
             if score <= 0:
                 continue
             section_boost = SECTION_RELEVANCE_BOOSTS.get(current_section, 50)
+            metadata_boost = self._metadata_score(metadata_by_section.get(current_section, {}).get(content))
             hits.append(
                 SearchHit(
                     text=f"{relative_name}: {stripped}",
-                    score=score + section_boost,
+                    score=score + section_boost + metadata_boost,
                     layer=LAYER_MEMORY,
                 )
             )
@@ -345,6 +375,39 @@ class MemoryStore:
             score += 40
         score += min(len(normalized_query), 40)
         return score
+
+    def _metadata_score(self, metadata: dict[str, str] | None) -> int:
+        if not metadata:
+            return 0
+
+        score = 0
+        kind = self._normalize_item(metadata.get("kind", "")).lower()
+        source = self._normalize_item(metadata.get("source", "")).lower()
+        score += KIND_RELEVANCE_BOOSTS.get(kind, 0)
+
+        if source.startswith("summary:"):
+            score += 5
+        else:
+            score += SOURCE_RELEVANCE_BOOSTS.get(source, 0)
+
+        score += self._recency_boost(metadata.get("created_at", ""))
+        return score
+
+    def _recency_boost(self, created_at: str) -> int:
+        parsed = _parse_timestamp(created_at)
+        if parsed is None:
+            return 0
+
+        age = datetime.now(timezone.utc) - parsed
+        if age.total_seconds() < 0:
+            return RECENCY_MAX_BOOST
+
+        age_days = age.total_seconds() / 86400
+        if age_days >= RECENCY_MAX_DAYS:
+            return 0
+
+        freshness = 1 - (age_days / RECENCY_MAX_DAYS)
+        return max(0, int(round(freshness * RECENCY_MAX_BOOST)))
 
     def _normalize_item(self, value: str) -> str:
         return " ".join(value.strip().split())
