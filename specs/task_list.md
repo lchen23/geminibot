@@ -19,11 +19,12 @@
 
 ### 依据
 - 已实现 Gemini CLI subprocess 调用、JSON 输出解析、resume 参数拼装：`app/agent/engine.py`
-- 当前运行时配置已切换为 `GEMINI_CLI_PATH=gemini`，与 adapter 的 `--resume latest` 语义对齐：`.env`, `.env.example`, `app/agent/engine.py:112`
+- 当前运行时已支持通过 `AI_PROVIDER` 在 Gemini CLI / Claude CLI 之间切换；默认配置仍使用 `GEMINI_CLI_PATH=gemini`，并保留 `CLAUDE_CLI_PATH=claude` 作为最小兼容路径：`.env.example`, `app/config.py`, `app/agent/engine.py:204`
 - 已补充 Feishu tenant token 获取与消息发送 API 调用：`app/gateway/feishu.py:92`, `app/gateway/feishu.py:115`
 - 已补充 WebSocket client 启动线程、事件 handler 注册和消息回调入口：`app/gateway/feishu.py:129`, `app/gateway/feishu.py:155`, `app/gateway/feishu.py:163`
-- 已用提供的 App ID / Secret 建立真实 WebSocket 连接，并收到 Feishu 入站消息：`app/gateway/feishu.py:41`, `app/gateway/feishu.py:162`
-- 运行时已生成 dedup 记录、会话状态与对话日志，且未产生 `unsent_messages.json` 回落文件，说明消息处理与回复发送链路已跑通：`data/dedup.json`, `data/sessions.json`, `workspaces/oc_453c37b1e78cac629e8e944384400f59/logs/2026-03-22.md`
+- 已用提供的 App ID / Secret 建立真实 WebSocket 连接，并收到 Feishu 入站消息：`app/gateway/feishu.py:41`, `app/gateway/feishu.py:297`
+- 已补充 Feishu CardKit 流式回复路径：创建 streaming card、发送 card reference、按 Gemini 增量输出持续更新卡片，并保留失败时回退到单次回复的路径：`app/gateway/feishu.py:180`, `app/gateway/feishu.py:205`, `app/gateway/feishu.py:255`
+- 运行时已生成 dedup 记录、会话状态与对话日志，真实 Feishu 流式验收已通过：`data/dedup.json`, `data/sessions.json`, `workspaces/oc_453c37b1e78cac629e8e944384400f59/logs/2026-03-22.md`
 - 已补充验证记录：`notes/gemini-cli-validation.md`, `notes/feishu-validation.md`
 - 已确定 v1 采用 workspace 内本地命令包装方式桥接 tool，并生成工具脚本与使用说明：`app/agent/workspace.py:12`, `app/agent/workspace.py:169`, `app/agent/workspace.py:235`
 
@@ -82,18 +83,19 @@
 
 ### 任务状态
 - 已完成：实现 `app/dispatcher.py`
-- 部分完成：统一 gateway/scheduler 输入到内部 request shape
+- 已完成：统一 gateway/scheduler 输入到内部 request shape
 - 已完成：内建命令解析 `/help`
 - 已完成：内建命令解析 `/clear`
 - 已完成：内建命令解析 `/remember`
 - 已完成：内建命令解析 `/tasks`
 - 已完成：添加 daily log append hook
 - 已完成：添加 card rendering adapter
+- 已完成：添加流式回复调度路径 `stream_handle()`
 
 ### 依据
 - Dispatcher 主逻辑已存在：`app/dispatcher.py`
-- Gateway 与 scheduler 都通过 `IncomingMessage` 进入 `handle()`：`app/dispatcher.py:32`, `app/dispatcher.py:73`
-- daily log：`app/dispatcher.py:63`
+- Gateway 与 scheduler 都通过 `IncomingMessage` 进入 dispatcher；普通回复走 `handle()`，流式回复走 `stream_handle()`：`app/dispatcher.py:32`, `app/dispatcher.py:40`, `app/dispatcher.py:61`
+- daily log：`app/dispatcher.py:110`
 - card rendering：`app/rendering/cards.py`
 
 ### 阶段结论
@@ -109,19 +111,22 @@
 - 已完成：实现 `app/agent/session_store.py`
 - 已完成：按模板初始化 per-conversation workspace
 - 已完成：从 persona files 构建 base system prompt
-- 已完成：通过 subprocess 调用 Gemini CLI
-- 已完成：解析输出并保存 session metadata
+- 已完成：通过 subprocess 调用选定的 CLI provider（Gemini / Claude）
+- 已完成：解析输出并保存 provider-aware session metadata
 - 已完成：向 Dispatcher 返回 structured result object
+- 已完成：支持 provider-aware `stream-json` 流式输出解析
 
 ### 依据
-- engine 主流程：`app/agent/engine.py:38`
+- engine 主流程：`app/agent/engine.py:51`
+- 已新增 `stream()`，并统一解析 Gemini / Claude 的 `stream-json` 增量事件：`app/agent/engine.py:90`, `app/agent/engine.py:336`
+- Claude 流式命令已补齐 `--verbose --include-partial-messages`，并兼容 `--resume <session_id>`：`app/agent/engine.py:211`, `app/agent/engine.py:219`, `app/agent/engine.py:221`
 - workspace 初始化：`app/agent/workspace.py:18`
 - session store：`app/agent/session_store.py`
-- system prompt 注入与 `GEMINI.md` 写入：`app/agent/engine.py:85`, `app/agent/engine.py:99`
+- system prompt 注入与 provider-aware `GEMINI.md` / `CLAUDE.md` 写入：`app/agent/engine.py:186`, `app/agent/engine.py:256`
 
 ### 风险 / 缺口
-- 当前 Gemini adapter 已验证 `-p`、`--output-format json`、`--resume latest` 与 workspace cwd 行为，并已完成本地 tool bridge 的真实自然语言验收
-- README 仍将 Gemini adapter 标记为待完善：`README.md:11`
+- Gemini adapter 已验证 `-p`、`--output-format json`、`--resume latest` 与 workspace cwd 行为，并已完成本地 tool bridge 的真实自然语言验收
+- Claude provider 的命令构造、JSON 结果解析、stream-json 事件解析、context 文件切换与 session 持久化已完成最小兼容验证，但真实在线请求仍受外部连接/认证稳定性影响
 - 仍需补充多轮 session 恢复与真实 Feishu 场景下的稳定性验收
 
 ### 阶段结论
@@ -270,9 +275,11 @@
 - 错误消息已有少量处理，如 Gemini CLI 未找到、非零退出：`app/agent/engine.py:54`, `app/agent/engine.py:73`
 - SchedulerStore 已新增 `running` / `started_at` / `run_token` 字段，以及 `claim_task_for_run()`、`complete_task_run()`、`fail_task_run()`，用于防止同一任务重入：`app/scheduler/store.py:47`, `app/scheduler/store.py:70`, `app/scheduler/store.py:99`, `app/scheduler/store.py:134`
 - SchedulerLoop 已在 dispatch 前 claim task，running 任务会被记录为 `skipped`，并支持 stale lock reclaim：`app/scheduler/loop.py:24`, `app/scheduler/loop.py:41`
-- AppConfig 已新增 `run_startup_checks()`，会在启动时校验 Feishu 配置、Gemini CLI 路径、默认时区与 data/workspace 目录，并在 `GEMINI_API_KEY` 缺失时给出 warning：`app/config.py:60`, `app/main.py:12`
+- AppConfig 已新增 provider-aware `run_startup_checks()`，会在启动时校验 Feishu 配置、`AI_PROVIDER`、选定 CLI 路径、默认时区与 data/workspace 目录，并在 `AI_PROVIDER=gemini` 且 `GEMINI_API_KEY` 缺失时给出 warning：`app/config.py:60`, `app/main.py:12`
 - Scheduler 时间语义已修正：`once`/`cron` 按任务或默认时区解释并统一存为 UTC，due 判断改为 timezone-aware 比较；真实 Feishu 定时验收已通过，未再出现“创建后立即触发”的问题：`app/scheduler/store.py:26`, `app/scheduler/store.py:177`, `app/scheduler/loop.py:42`, `data/schedule_runs.json:39`
-- README 已补到 operator runbook 水平，并记录 startup self-check、scheduler overlap、timezone 语义、排查要点和验收 checklist：`README.md:26`, `README.md:137`, `README.md:157`
+- README 已补到 operator runbook 水平，并记录 startup self-check、scheduler overlap、timezone 语义、流式回复行为、排查要点和验收 checklist：`README.md:26`, `README.md:87`, `README.md:150`
+- Feishu 流式回复已落地：共享流式路径会消费 Gemini / Claude 的 provider-specific `stream-json` 增量输出，并通过 CardKit streaming card 持续更新；真实 Gemini Feishu 流式验收已通过，且已修正 `element_id` 的 Feishu 格式限制问题：`app/agent/engine.py:90`, `app/agent/engine.py:336`, `app/gateway/feishu.py:180`, `app/gateway/feishu.py:202`
+- 已完成最小双 CLI 兼容：支持 `AI_PROVIDER` 切换、provider-aware context 文件 (`GEMINI.md` / `CLAUDE.md`)、provider-aware session 结构，以及 Claude `result` / `system` / `assistant` / `result` JSON schema 解析；Claude 在线成功 E2E 仍待外部网络条件恢复后补验：`app/config.py`, `app/agent/engine.py`, `.env.example`
 
 ### 阶段结论
 - **部分完成**
@@ -287,14 +294,15 @@
 - 未完成：Phase 10
 
 ## 当前整体开发进展
-项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 真实调用验证、Feishu -> Dispatcher -> Gemini -> Feishu 最小闭环、workspace/persona/memory/scheduler 存储层、Scheduler 的 due-task dispatch 与执行日志闭环，以及 v1 本地命令包装式 tool bridge；本轮已将运行时 `GEMINI_CLI_PATH` 切换为 `gemini`，完成 Gemini 对 memory/scheduler tools 的真实自然语言自主调用验收，补上 scheduler overlap lock/skip 与 stale lock reclaim，并加入启动阶段的 required config / CLI / 默认时区 / 目录自检；同时已修复 scheduler 的时区/时间语义问题，在 `America/Los_Angeles` 配置下完成真实 Feishu 定时验收，确认 once 任务按本地时间正确换算到 UTC 后触发。
+项目已完成基础骨架、Dispatcher 主流程、Gemini CLI adapter 真实调用验证、Feishu -> Dispatcher -> Gemini -> Feishu 最小闭环、workspace/persona/memory/scheduler 存储层、Scheduler 的 due-task dispatch 与执行日志闭环，以及 v1 本地命令包装式 tool bridge；本轮已将运行时 `GEMINI_CLI_PATH` 切换为 `gemini`，完成 Gemini 对 memory/scheduler tools 的真实自然语言自主调用验收，补上 scheduler overlap lock/skip 与 stale lock reclaim，并加入启动阶段的 required config / CLI / 默认时区 / 目录自检；同时已修复 scheduler 的时区/时间语义问题，在 `America/Los_Angeles` 配置下完成真实 Feishu 定时验收，确认 once 任务按本地时间正确换算到 UTC 后触发；另外已补上 Feishu 流式回复能力，Gemini 增量输出现在可以通过 CardKit streaming card 在真实会话中持续更新展示；最新还补齐了“最小改动可上线”的双 CLI 兼容路径，当前可通过 `AI_PROVIDER` 在 gemini-cli / claude-cli 间切换，并按 provider 切换命令构造、上下文文件、session 持久化与 JSON/stream-json 解析。
 
 ## 建议下一步优先级
 1. 继续完善 fallback cards / 更清晰错误提示
 2. 把 scheduler stale timeout 配置化，并视需要补 richer retry/backoff 策略
 3. 优化 startup self-check 的 warning/error 策略与可配置性
 4. 视需要为旧 scheduler 存量 naive 时间数据补一次迁移
-5. 最后再推进 skills 扩展框架
+5. 视需要为流式回复补更细的节流 / 频率控制
+6. 最后再推进 skills 扩展框架
 
 # 下一轮开发待办
 
@@ -302,14 +310,16 @@
 **目标**：先把“Feishu 发消息 → Python 服务 → Gemini → Feishu 回消息”跑通。
 
 ### 当前进展
-- 已完成 tenant token 获取与真实消息发送 API 封装：`app/gateway/feishu.py:92`, `app/gateway/feishu.py:115`
-- 已完成 WebSocket client 启动线程、事件 handler 注册与消息回调骨架：`app/gateway/feishu.py:129`, `app/gateway/feishu.py:155`, `app/gateway/feishu.py:163`
+- 已完成 tenant token 获取与真实消息发送 API 封装：`app/gateway/feishu.py:108`, `app/gateway/feishu.py:150`
+- 已完成 WebSocket client 启动线程、事件 handler 注册与消息回调骨架：`app/gateway/feishu.py:297`, `app/gateway/feishu.py:324`, `app/gateway/feishu.py:332`
+- 已补上 Feishu CardKit 流式回复路径，并完成真实流式验收
 - 已完成真实环境联调：确认 WebSocket 连接、收到测试消息、进入 dedup + Dispatcher 流程，并写入会话与日志
 
 ### 待办
 1. 补充 `notes/feishu-validation.md` 联调记录
 2. 如需增强稳定性，可补充更细的入站事件日志
-3. 如需支持更多消息类型，再扩展 event payload 解析
+3. 视需要为流式回复补更新节流/频率控制
+4. 如需支持更多消息类型，再扩展 event payload 解析
 
 ### 交付标准
 - 在 Feishu 发 `hello`
@@ -377,21 +387,20 @@
 - `app/agent/workspace.py:12`
 - `app/agent/engine.py:124`
 
-## P3：补齐 Gemini CLI 适配验证与稳定性
+## P3：补齐 CLI provider 适配验证与稳定性
 **目标**：把现在“能调用”提升到“行为确认稳定”。
 
+### 当前进展
+- 已完成 Gemini CLI 的真实参数行为验证：`--resume latest`、JSON 输出、cwd/workspace
+- 已完成 Claude 最小兼容路径验证：`result` JSON 输出、`stream-json` 事件 schema、`--resume <session_id>` 拼装、`CLAUDE.md` 上下文切换
+- 已确认 Claude 流式模式需附带 `--verbose --include-partial-messages`
+- 已覆盖 CLI 不存在、返回非 JSON、非零退出码等基础异常场景解析
+
 ### 待办
-1. 验证 Gemini CLI 的真实参数行为
-   - `--resume`
-   - JSON 输出
-   - cwd/workspace
-2. 确认 session 恢复在多轮会话里的表现
-3. 补 validation notes
-4. 明确异常场景处理：
-   - CLI 不存在
-   - 返回非 JSON
-   - 非零退出码
-5. 用真实 Feishu 消息做一次多轮对话验收
+1. 确认 session 恢复在 Gemini / Claude 多轮会话里的表现
+2. 补 provider 维度 validation notes
+3. 用真实 Feishu 消息做一次 Claude provider 多轮对话验收
+4. 在外部网络恢复后补一次 Claude 成功在线回复验收
 
 ### 交付标准
 - 单轮对话稳定

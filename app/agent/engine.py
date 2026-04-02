@@ -50,9 +50,9 @@ class GeminiAgentEngine:
 
     def run(self, request: AgentRequest) -> AgentResult:
         workspace = self.workspace_manager.ensure_workspace(request.conversation_id)
-        session = self.session_store.get(request.conversation_id)
+        session = self._load_session(request.conversation_id)
         system_prompt = self._build_system_prompt(workspace)
-        self._write_gemini_context_file(workspace, system_prompt)
+        self._write_context_file(workspace, system_prompt)
         command = self._build_command(request, session)
         env = self._build_environment(request, workspace)
 
@@ -67,7 +67,7 @@ class GeminiAgentEngine:
             )
         except FileNotFoundError:
             return AgentResult(
-                text="Gemini CLI was not found. Please install it or configure GEMINI_CLI_PATH.",
+                text=f"{self._provider_label()} CLI was not found. Please install it or configure the matching CLI path.",
                 raw_output="",
             )
 
@@ -76,17 +76,11 @@ class GeminiAgentEngine:
         parsed = self._parse_output(stdout, stderr)
 
         if parsed.session_id:
-            self.session_store.set(
-                request.conversation_id,
-                {
-                    "session_id": parsed.session_id,
-                    "resume": "latest",
-                },
-            )
+            self._save_session(request.conversation_id, parsed.session_id)
 
         if completed.returncode != 0 and not parsed.text:
             return AgentResult(
-                text=stderr or "Gemini CLI exited with a non-zero status.",
+                text=stderr or f"{self._provider_label()} CLI exited with a non-zero status.",
                 raw_output=self._join_output(stdout, stderr),
                 session_id=parsed.session_id,
                 model=parsed.model,
@@ -95,10 +89,10 @@ class GeminiAgentEngine:
 
     def stream(self, request: AgentRequest) -> Iterator[AgentStreamEvent]:
         workspace = self.workspace_manager.ensure_workspace(request.conversation_id)
-        session = self.session_store.get(request.conversation_id)
+        session = self._load_session(request.conversation_id)
         system_prompt = self._build_system_prompt(workspace)
-        self._write_gemini_context_file(workspace, system_prompt)
-        command = self._build_command(request, session, output_format="stream-json")
+        self._write_context_file(workspace, system_prompt)
+        command = self._build_command(request, session, output_format=self._stream_output_format())
         env = self._build_environment(request, workspace)
 
         try:
@@ -112,7 +106,7 @@ class GeminiAgentEngine:
             )
         except FileNotFoundError:
             yield AgentStreamEvent(
-                text="Gemini CLI was not found. Please install it or configure GEMINI_CLI_PATH.",
+                text=f"{self._provider_label()} CLI was not found. Please install it or configure the matching CLI path.",
                 done=True,
                 error="cli_not_found",
             )
@@ -153,17 +147,11 @@ class GeminiAgentEngine:
             stderr = process.stderr.read().strip()
 
         if session_id:
-            self.session_store.set(
-                request.conversation_id,
-                {
-                    "session_id": session_id,
-                    "resume": "latest",
-                },
-            )
+            self._save_session(request.conversation_id, session_id)
 
         if returncode != 0 and not full_text:
             yield AgentStreamEvent(
-                text=stderr or "Gemini CLI exited with a non-zero status.",
+                text=stderr or f"{self._provider_label()} CLI exited with a non-zero status.",
                 done=True,
                 session_id=session_id,
                 model=model,
@@ -213,13 +201,6 @@ class GeminiAgentEngine:
             parts.append(f"## Recent Summaries\n{recent}")
         return "\n\n".join(parts)
 
-    def _write_gemini_context_file(self, workspace: Path, system_prompt: str) -> None:
-        context_file = workspace / "GEMINI.md"
-        if system_prompt:
-            context_file.write_text(system_prompt.rstrip() + "\n", encoding="utf-8")
-        elif context_file.exists():
-            context_file.unlink()
-
     def _build_command(
         self,
         request: AgentRequest,
@@ -227,14 +208,28 @@ class GeminiAgentEngine:
         *,
         output_format: str = "json",
     ) -> list[str]:
+        if self.config.ai_provider == "claude":
+            command = [
+                self.config.selected_cli_path,
+                "-p",
+                request.text,
+                "--output-format",
+                output_format,
+            ]
+            if output_format == "stream-json":
+                command.extend(["--verbose", "--include-partial-messages"])
+            if session and session.get("provider") == "claude" and session.get("session_id"):
+                command.extend(["--resume", session["session_id"]])
+            return command
+
         command = [
-            self.config.gemini_cli_path,
+            self.config.selected_cli_path,
             "-p",
             request.text,
             "--output-format",
             output_format,
         ]
-        if session and session.get("resume"):
+        if session and session.get("provider") == "gemini" and session.get("resume"):
             command.extend(["--resume", session["resume"]])
         return command
 
@@ -258,16 +253,55 @@ class GeminiAgentEngine:
             return ""
         return guide_path.read_text(encoding="utf-8").strip()
 
+    def _write_context_file(self, workspace: Path, system_prompt: str) -> None:
+        context_file = workspace / self.config.context_filename
+        alternate_file = workspace / ("CLAUDE.md" if self.config.context_filename == "GEMINI.md" else "GEMINI.md")
+        if alternate_file.exists():
+            alternate_file.unlink()
+        if system_prompt:
+            context_file.write_text(system_prompt.rstrip() + "\n", encoding="utf-8")
+        elif context_file.exists():
+            context_file.unlink()
+
+    def _load_session(self, conversation_id: str) -> dict | None:
+        session = self.session_store.get(conversation_id)
+        if not session:
+            return None
+        provider = session.get("provider")
+        if provider and provider != self.config.ai_provider:
+            return None
+        return session
+
+    def _save_session(self, conversation_id: str, session_id: str) -> None:
+        payload = {
+            "provider": self.config.ai_provider,
+            "session_id": session_id,
+        }
+        if self.config.ai_provider == "gemini":
+            payload["resume"] = "latest"
+        self.session_store.set(conversation_id, payload)
+
+    def _stream_output_format(self) -> str:
+        return "stream-json"
+
+    def _provider_label(self) -> str:
+        return "Claude" if self.config.ai_provider == "claude" else "Gemini"
+
     def _parse_output(self, stdout: str, stderr: str) -> AgentResult:
         raw_output = self._join_output(stdout, stderr)
         if not stdout:
-            return AgentResult(text=stderr or "Gemini CLI returned no output.", raw_output=raw_output)
+            return AgentResult(text=stderr or f"{self._provider_label()} CLI returned no output.", raw_output=raw_output)
 
         try:
             data = json.loads(stdout)
         except json.JSONDecodeError:
             return AgentResult(text=stdout, raw_output=raw_output)
 
+        if self.config.ai_provider == "claude":
+            return self._parse_claude_output(data, raw_output, stderr)
+        return self._parse_gemini_output(data, raw_output, stderr)
+
+    def _parse_gemini_output(self, data: dict, raw_output: str, stderr: str) -> AgentResult:
         error = data.get("error")
         if isinstance(error, dict):
             error_message = error.get("message") or json.dumps(error, ensure_ascii=False)
@@ -286,12 +320,30 @@ class GeminiAgentEngine:
             model=data.get("model"),
         )
 
+    def _parse_claude_output(self, data: dict, raw_output: str, stderr: str) -> AgentResult:
+        result = data.get("result")
+        if isinstance(result, str) and result:
+            text = result
+        else:
+            text = stderr or json.dumps(data, ensure_ascii=False)
+        return AgentResult(
+            text=text,
+            raw_output=raw_output,
+            session_id=data.get("session_id"),
+            model=data.get("model") or data.get("fallback_model"),
+        )
+
     def _parse_stream_event(self, raw_line: str) -> AgentStreamEvent:
         try:
             data = json.loads(raw_line)
         except json.JSONDecodeError:
             return AgentStreamEvent(delta=raw_line, raw_event=raw_line)
 
+        if self.config.ai_provider == "claude":
+            return self._parse_claude_stream_event(data, raw_line)
+        return self._parse_gemini_stream_event(data, raw_line)
+
+    def _parse_gemini_stream_event(self, data: dict, raw_line: str) -> AgentStreamEvent:
         event_type = data.get("type")
         if event_type == "init":
             return AgentStreamEvent(session_id=data.get("session_id"), model=data.get("model"), raw_event=raw_line)
@@ -311,6 +363,31 @@ class GeminiAgentEngine:
             else:
                 message = json.dumps(data, ensure_ascii=False)
             return AgentStreamEvent(text=message, done=True, raw_event=raw_line, error="stream_error")
+        return AgentStreamEvent(raw_event=raw_line)
+
+    def _parse_claude_stream_event(self, data: dict, raw_line: str) -> AgentStreamEvent:
+        event_type = data.get("type")
+        if event_type == "system":
+            return AgentStreamEvent(
+                session_id=data.get("session_id"),
+                model=data.get("model"),
+                raw_event=raw_line,
+            )
+        if event_type == "assistant":
+            message = data.get("message")
+            if isinstance(message, dict):
+                model = message.get("model")
+                content = message.get("content")
+                if isinstance(content, list):
+                    text_parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+                    text = "".join(text_parts)
+                    if text:
+                        return AgentStreamEvent(delta=text, raw_event=raw_line, model=model)
+        if event_type == "result":
+            result_text = data.get("result")
+            if data.get("is_error"):
+                return AgentStreamEvent(text=result_text or json.dumps(data, ensure_ascii=False), done=True, raw_event=raw_line, error="result_error")
+            return AgentStreamEvent(done=True, raw_event=raw_line, session_id=data.get("session_id"))
         return AgentStreamEvent(raw_event=raw_line)
 
     def _join_output(self, stdout: str, stderr: str) -> str:
