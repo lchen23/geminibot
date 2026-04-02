@@ -4,6 +4,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from app.config import AppConfig
+from app.memory.consolidate import _classify_long_term_note
 
 REQUIRED_MEMORY_SECTIONS = (
     "User Preferences",
@@ -44,9 +45,10 @@ class MemoryStore:
         cleaned = self._normalize_item(content)
         if not cleaned:
             return
-        existing = {self._normalize_item(item) for item in sections["Saved Notes"]}
+        target_section = _classify_long_term_note(cleaned)
+        existing = {self._normalize_item(item) for item in sections[target_section]}
         if cleaned not in existing:
-            sections["Saved Notes"].append(cleaned)
+            sections[target_section].append(cleaned)
             self._write_memory_sections(conversation_id, sections)
 
     def read_memory(self, conversation_id: str) -> str:
