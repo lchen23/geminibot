@@ -4,7 +4,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from app.config import AppConfig
-from app.memory.consolidate import _classify_long_term_note
+from app.memory.consolidate import _classify_long_term_note, _rewrite_memory_sections
 
 REQUIRED_MEMORY_SECTIONS = (
     "User Preferences",
@@ -137,8 +137,11 @@ class MemoryStore:
         return self._parse_memory_sections(text)
 
     def _write_memory_sections(self, conversation_id: str, sections: dict[str, list[str]]) -> None:
-        memory_file = self.get_workspace(conversation_id) / "MEMORY.md"
-        memory_file.write_text(self._serialize_memory_sections(sections), encoding="utf-8")
+        workspace = self.get_workspace(conversation_id)
+        memory_file = workspace / "MEMORY.md"
+        if not memory_file.exists():
+            memory_file.write_text(self._serialize_memory_sections(self._default_memory_sections()), encoding="utf-8")
+        _rewrite_memory_sections(memory_file, sections, config=self.config, workspace=workspace)
 
     def _default_memory_sections(self) -> dict[str, list[str]]:
         return {name: list(items) for name, items in DEFAULT_MEMORY_ITEMS.items()}
@@ -175,14 +178,14 @@ class MemoryStore:
         lines = ["# Memory", ""]
 
         for name in ordered_names:
-            items = self._dedupe_items(sections.get(name, []))
+            items = self._exact_dedupe(sections.get(name, []))
             lines.append(f"## {name}")
             lines.extend(f"- {item}" for item in items)
             lines.append("")
 
         return "\n".join(lines).rstrip() + "\n"
 
-    def _dedupe_items(self, items: list[str]) -> list[str]:
+    def _exact_dedupe(self, items: list[str]) -> list[str]:
         deduped: list[str] = []
         seen: set[str] = set()
         for item in items:

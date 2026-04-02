@@ -14,6 +14,7 @@ SUMMARY_FALLBACK_PREFIX = "Semantic summary unavailable"
 MAX_SEMANTIC_SUMMARY_BULLETS = 5
 MAX_LONG_TERM_NOTES = 5
 MEMORY_SECTIONS = ("User Preferences", "Stable Facts", "Saved Notes")
+SEMANTIC_DEDUPE_SECTIONS = {"User Preferences", "Stable Facts"}
 PREFERENCE_HINTS = (
     "prefer",
     "prefers",
@@ -132,7 +133,7 @@ def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = Non
         summary_file.write_text("\n\n".join(summary_sections).rstrip() + "\n", encoding="utf-8")
 
     if notes_changed:
-        _rewrite_memory_sections(memory_file, memory_sections)
+        _rewrite_memory_sections(memory_file, memory_sections, config=config, workspace=workspace)
 
 
 def _generate_semantic_summary(
@@ -164,7 +165,7 @@ def _generate_semantic_summary(
             check=False,
             capture_output=True,
             text=True,
-            env=_build_summary_environment(config, workspace),
+            env=_build_cli_environment(config, workspace),
         )
     except OSError as exc:
         return SummaryGenerationResult(
@@ -209,7 +210,7 @@ Conversation log:
 """
 
 
-def _build_summary_environment(config: AppConfig, workspace: Path) -> dict[str, str]:
+def _build_cli_environment(config: AppConfig, workspace: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
         {
@@ -309,6 +310,124 @@ def _classify_long_term_note(note: str) -> str:
     return "Saved Notes"
 
 
+def _semantic_dedupe_items(
+    section_name: str,
+    items: list[str],
+    *,
+    config: AppConfig | None,
+    workspace: Path | None,
+) -> list[str]:
+    deduped = _exact_dedupe(items)
+    if section_name not in SEMANTIC_DEDUPE_SECTIONS or len(deduped) < 2 or config is None or workspace is None:
+        return deduped
+
+    merged: list[str] = []
+    for item in deduped:
+        if not merged:
+            merged.append(item)
+            continue
+
+        decision = _semantic_duplicate_decision(section_name, merged, item, config, workspace)
+        if decision is None:
+            merged.append(item)
+            continue
+
+        duplicate_of = decision.get("duplicate_of")
+        canonical = _normalize_item(decision.get("canonical") or item)
+        if duplicate_of is None:
+            merged.append(item)
+            continue
+        if not isinstance(duplicate_of, int) or duplicate_of < 0 or duplicate_of >= len(merged):
+            merged.append(item)
+            continue
+
+        if canonical:
+            merged[duplicate_of] = canonical
+    return _exact_dedupe(merged)
+
+
+def _semantic_duplicate_decision(
+    section_name: str,
+    existing_items: list[str],
+    candidate: str,
+    config: AppConfig,
+    workspace: Path,
+) -> dict[str, object] | None:
+    cli_path = config.selected_cli_path.strip()
+    if not cli_path or shutil.which(cli_path) is None:
+        return None
+
+    prompt = _build_dedupe_prompt(section_name, existing_items, candidate)
+    command = [cli_path, "-p", prompt, "--output-format", "json"]
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=workspace,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_build_cli_environment(config, workspace),
+        )
+    except OSError:
+        return None
+
+    text = _extract_cli_text(config.ai_provider, completed.stdout.strip(), completed.stderr.strip())
+    if completed.returncode != 0 or not text:
+        return None
+
+    return _parse_dedupe_decision(text)
+
+
+def _build_dedupe_prompt(section_name: str, existing_items: list[str], candidate: str) -> str:
+    existing_json = json.dumps(existing_items, ensure_ascii=False)
+    candidate_json = json.dumps(candidate, ensure_ascii=False)
+    return f"""You are deduplicating long-term memory entries for the section {section_name}.
+
+Return JSON only with this schema:
+{{"duplicate_of": <integer index or null>, "canonical": <string>}}
+
+Rules:
+- Treat entries as duplicates only if they express the same durable meaning.
+- Do not merge loosely related statements.
+- Prefer the more informative wording when two entries are duplicates.
+- Keep canonical wording concise and factual.
+- If the candidate is not a duplicate of any existing item, return {{"duplicate_of": null, "canonical": ""}}.
+
+Existing items JSON:
+{existing_json}
+
+Candidate JSON:
+{candidate_json}
+"""
+
+
+def _parse_dedupe_decision(text: str) -> dict[str, object] | None:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = [line for line in cleaned.splitlines() if not line.startswith("```")]
+        cleaned = "\n".join(lines).strip()
+
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    duplicate_of = payload.get("duplicate_of")
+    canonical = payload.get("canonical", "")
+    if duplicate_of is not None and not isinstance(duplicate_of, int):
+        return None
+    if canonical is not None and not isinstance(canonical, str):
+        return None
+
+    return {
+        "duplicate_of": duplicate_of,
+        "canonical": canonical or "",
+    }
+
+
 def _load_existing_valid_summaries(summary_file: Path) -> dict[str, ParsedSummary]:
     if not summary_file.exists():
         return {}
@@ -395,20 +514,27 @@ def _read_memory_sections(memory_file: Path) -> dict[str, list[str]]:
     return sections
 
 
-def _rewrite_memory_sections(memory_file: Path, sections: dict[str, list[str]]) -> None:
+def _rewrite_memory_sections(
+    memory_file: Path,
+    sections: dict[str, list[str]],
+    *,
+    config: AppConfig | None,
+    workspace: Path | None,
+) -> None:
     if not memory_file.exists():
         return
 
     original = memory_file.read_text(encoding="utf-8")
     lines = ["# Memory", ""]
     for section_name in MEMORY_SECTIONS:
+        items = _semantic_dedupe_items(section_name, sections.get(section_name, []), config=config, workspace=workspace)
         lines.append(f"## {section_name}")
-        lines.extend(f"- {item}" for item in _dedupe(sections.get(section_name, [])))
+        lines.extend(f"- {item}" for item in items)
         lines.append("")
 
     for section_name, items in _extract_extra_sections(original).items():
         lines.append(f"## {section_name}")
-        lines.extend(f"- {item}" for item in _dedupe(items))
+        lines.extend(f"- {item}" for item in _exact_dedupe(items))
         lines.append("")
 
     memory_file.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -432,7 +558,7 @@ def _extract_extra_sections(text: str) -> dict[str, list[str]]:
     return extras
 
 
-def _dedupe(items: list[str]) -> list[str]:
+def _exact_dedupe(items: list[str]) -> list[str]:
     deduped: list[str] = []
     seen: set[str] = set()
     for item in items:
