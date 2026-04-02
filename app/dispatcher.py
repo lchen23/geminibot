@@ -168,11 +168,11 @@ class Dispatcher:
         return "\n".join(
             [
                 "Supported commands:",
-                "- /help",
-                "- /clear",
-                "- /remember <text>",
-                "- /tasks",
-                "- /schedule <once|cron> | <time-or-cron> | <prompt>",
-                "- /delete-task <task_id>",
+                "- /help — Show this help message.",
+                "- /clear — Clear the current conversation context and consolidate memory.",
+                "- /remember <text> — Save a memory note for this conversation.",
+                "- /tasks — List scheduled tasks for the current chat.",
+                "- /schedule <once|cron> | <time-or-cron> | <prompt> — Create a one-time or recurring scheduled task.",
+                "- /delete-task <task_id> — Delete a scheduled task by ID.",
             ]
         )

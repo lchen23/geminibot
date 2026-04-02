@@ -1,7 +1,7 @@
 # User
 name: Unknown
-language: 中文
-timezone: Asia/Shanghai
+language: English
+timezone: America/Los_Angeles
 preferences:
 - concise replies
 - practical implementation details
