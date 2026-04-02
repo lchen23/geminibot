@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
@@ -21,6 +22,25 @@ DEFAULT_MEMORY_ITEMS = {
     "Stable Facts": ["GeminiBot uses Gemini CLI Agent as the core reasoning runtime."],
     "Saved Notes": [],
 }
+LAYER_MEMORY = "memory"
+LAYER_SUMMARY = "summary"
+LAYER_LOG = "log"
+HIGH_PRIORITY_SUMMARY_HEADINGS = {"### Semantic Summary", "### Potential Long-Term Notes"}
+SECTION_RELEVANCE_BOOSTS = {
+    "User Preferences": 80,
+    "Stable Facts": 70,
+    "Saved Notes": 90,
+}
+SUMMARY_RELEVANCE_BOOST = 75
+LOG_RELEVANCE_BOOST = 10
+MAX_LOG_RESULTS_WHEN_HIGHER_LAYERS_HIT = 2
+
+
+@dataclass(slots=True)
+class SearchHit:
+    text: str
+    score: int
+    layer: str
 
 
 class MemoryStore:
@@ -104,16 +124,21 @@ class MemoryStore:
 
     def search(self, conversation_id: str, query: str, limit: int = 10) -> list[str]:
         workspace = self.get_workspace(conversation_id)
-        lowered = query.lower()
-        matches: list[str] = []
-        for file_path in self._iter_memory_files(workspace):
-            relative_name = file_path.relative_to(workspace).as_posix()
-            for line in file_path.read_text(encoding="utf-8").splitlines():
-                if lowered in line.lower():
-                    matches.append(f"{relative_name}: {line.strip()}")
-                    if len(matches) >= limit:
-                        return matches
-        return matches
+        normalized_query = self._normalize_item(query)
+        if not normalized_query or limit <= 0:
+            return []
+
+        memory_hits = self._search_memory_file(workspace, normalized_query)
+        summary_hits = self._search_summary_files(workspace, normalized_query)
+        higher_layer_hits = [*memory_hits, *summary_hits]
+        higher_layer_count = len(higher_layer_hits)
+        log_limit = max(0, limit - higher_layer_count)
+        if higher_layer_count:
+            log_limit = min(log_limit, MAX_LOG_RESULTS_WHEN_HIGHER_LAYERS_HIT)
+
+        log_hits = self._search_log_files(workspace, normalized_query, limit=log_limit)
+        ranked = sorted([*higher_layer_hits, *log_hits], key=lambda hit: (-hit.score, hit.text))
+        return [hit.text for hit in ranked[:limit]]
 
     def list_by_date(self, conversation_id: str, start_date: str, end_date: str) -> list[str]:
         workspace = self.get_workspace(conversation_id)
@@ -134,20 +159,91 @@ class MemoryStore:
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
 
-    def _iter_memory_files(self, workspace: Path) -> list[Path]:
-        files: list[Path] = []
+    def _search_memory_file(self, workspace: Path, query: str) -> list[SearchHit]:
         memory_file = workspace / "MEMORY.md"
-        if memory_file.exists():
-            files.append(memory_file)
+        if not memory_file.exists():
+            return []
 
+        hits: list[SearchHit] = []
+        current_section = ""
+        relative_name = memory_file.relative_to(workspace).as_posix()
+        for raw_line in memory_file.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("## "):
+                current_section = SECTION_ALIASES.get(stripped.removeprefix("## ").strip(), stripped.removeprefix("## ").strip())
+                continue
+            if not stripped.startswith("- "):
+                continue
+            content = self._normalize_item(stripped[2:])
+            score = self._score_match(content, query)
+            if score <= 0:
+                continue
+            section_boost = SECTION_RELEVANCE_BOOSTS.get(current_section, 50)
+            hits.append(
+                SearchHit(
+                    text=f"{relative_name}: {stripped}",
+                    score=score + section_boost,
+                    layer=LAYER_MEMORY,
+                )
+            )
+        return hits
+
+    def _search_summary_files(self, workspace: Path, query: str) -> list[SearchHit]:
         summaries_dir = workspace / "summaries"
-        if summaries_dir.exists():
-            files.extend(sorted(summaries_dir.glob("*.md"), reverse=True))
+        if not summaries_dir.exists():
+            return []
 
+        hits: list[SearchHit] = []
+        for file_path in sorted(summaries_dir.glob("*.md"), reverse=True):
+            relative_name = file_path.relative_to(workspace).as_posix()
+            current_heading = ""
+            for raw_line in file_path.read_text(encoding="utf-8").splitlines():
+                stripped = raw_line.strip()
+                if stripped.startswith("### "):
+                    current_heading = stripped
+                    continue
+                if not stripped.startswith("- "):
+                    continue
+                content = self._normalize_item(stripped[2:])
+                score = self._score_match(content, query)
+                if score <= 0:
+                    continue
+                heading_boost = SUMMARY_RELEVANCE_BOOST if current_heading in HIGH_PRIORITY_SUMMARY_HEADINGS else 40
+                hits.append(
+                    SearchHit(
+                        text=f"{relative_name}: {stripped}",
+                        score=score + heading_boost,
+                        layer=LAYER_SUMMARY,
+                    )
+                )
+        return hits
+
+    def _search_log_files(self, workspace: Path, query: str, limit: int) -> list[SearchHit]:
+        if limit <= 0:
+            return []
         logs_dir = workspace / "logs"
-        if logs_dir.exists():
-            files.extend(sorted(logs_dir.glob("*.md"), reverse=True))
-        return files
+        if not logs_dir.exists():
+            return []
+
+        hits: list[SearchHit] = []
+        for file_path in sorted(logs_dir.glob("*.md"), reverse=True):
+            relative_name = file_path.relative_to(workspace).as_posix()
+            for raw_line in file_path.read_text(encoding="utf-8").splitlines():
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("### "):
+                    continue
+                score = self._score_match(stripped, query)
+                if score <= 0:
+                    continue
+                hits.append(
+                    SearchHit(
+                        text=f"{relative_name}: {stripped}",
+                        score=score + LOG_RELEVANCE_BOOST,
+                        layer=LAYER_LOG,
+                    )
+                )
+        hits.sort(key=lambda hit: (-hit.score, hit.text))
+        return hits[:limit]
 
     def _read_memory_sections(self, conversation_id: str) -> dict[str, list[str]]:
         text = self.read_memory(conversation_id)
@@ -223,6 +319,32 @@ class MemoryStore:
             seen.add(cleaned)
             deduped.append(cleaned)
         return deduped
+
+    def _score_match(self, text: str, query: str) -> int:
+        normalized_text = self._normalize_item(text).lower()
+        normalized_query = self._normalize_item(query).lower()
+        if not normalized_text or not normalized_query:
+            return 0
+
+        query_tokens = [token for token in normalized_query.split(" ") if token]
+        if not query_tokens:
+            return 0
+
+        score = 0
+        if normalized_text == normalized_query:
+            score += 150
+        elif normalized_query in normalized_text:
+            score += 90
+
+        matched_tokens = sum(1 for token in query_tokens if token in normalized_text)
+        if matched_tokens == 0:
+            return 0
+
+        score += matched_tokens * 20
+        if matched_tokens == len(query_tokens):
+            score += 40
+        score += min(len(normalized_query), 40)
+        return score
 
     def _normalize_item(self, value: str) -> str:
         return " ".join(value.strip().split())
