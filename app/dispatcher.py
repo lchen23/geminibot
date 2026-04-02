@@ -125,7 +125,7 @@ class Dispatcher:
 
     def _handle_clear(self, conversation_id: str) -> str:
         workspace = self.memory_store.get_workspace(conversation_id)
-        consolidate_workspace_memory(workspace)
+        consolidate_workspace_memory(workspace, config=self.config)
         self.agent.clear_conversation(conversation_id)
         return "Conversation context cleared. Memory was consolidated from current logs."
 

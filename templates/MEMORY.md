@@ -3,5 +3,7 @@
 ## User Preferences
 - Prefer concise and practical responses.
 
-## Project Facts
+## Stable Facts
 - GeminiBot uses Gemini CLI Agent as the core reasoning runtime.
+
+## Saved Notes
