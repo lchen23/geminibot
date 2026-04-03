@@ -11,9 +11,15 @@ from app.config import AppConfig
 from app.memory.consolidate import (
     SummaryGenerationResult,
     _apply_retention_policy,
+    _apply_summary_updates,
     _fallback_summary,
+    _generate_summary_updates,
     _load_consolidation_state,
     _load_memory_metadata,
+    _load_all_valid_summaries,
+    _merge_generated_notes_into_memory,
+    generate_workspace_summaries,
+    merge_workspace_memory,
     _semantic_dedupe_entries,
     consolidate_workspace_memory,
 )
@@ -412,6 +418,83 @@ class MemoryRegressionTests(unittest.TestCase):
         self.assertIn("- Existing summary block.", rewritten)
         self.assertIn("## 2026-04-02", rewritten)
         self.assertIn("- Appended summary block.", rewritten)
+
+    def test_generate_summary_updates_separates_summary_stage_from_memory_merge(self) -> None:
+        logs_dir = self.workspace / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "2026-04-01.md").write_text(
+            "### 09:00:00\n"
+            "**Q:** Remember the release style.\n\n"
+            "**A:** Stored the release style.\n",
+            encoding="utf-8",
+        )
+        state = _load_consolidation_state(self.workspace)
+
+        with patch(
+            "app.memory.consolidate._generate_semantic_summary",
+            return_value=SummaryGenerationResult(
+                text=(
+                    "## 2026-04-01\n"
+                    "### Semantic Summary\n"
+                    "- Summarized 2026-04-01.\n"
+                    "### Potential Long-Term Notes\n"
+                    "- Prefer concise release notes.\n"
+                )
+            ),
+        ):
+            updates, last_processed = _generate_summary_updates(
+                workspace=self.workspace,
+                log_files=sorted(logs_dir.glob("*.md")),
+                existing_valid_summaries={},
+                state=state,
+                config=self.config,
+            )
+
+        self.assertEqual(last_processed, "2026-04-01")
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0].log_date, "2026-04-01")
+        self.assertIsNotNone(updates[0].parsed)
+
+        summary_file = self.workspace / "summaries" / f"{date.today().isoformat()}.md"
+        summary_map: dict[str, str] = {}
+        _apply_summary_updates(summary_file, summary_map, updates)
+        self.assertIn("Summarized 2026-04-01.", summary_file.read_text(encoding="utf-8"))
+
+        _merge_generated_notes_into_memory(self.workspace, updates, config=self.config)
+        memory_text = (self.workspace / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertIn("Prefer concise release notes.", memory_text)
+
+    def test_generate_and_merge_workspace_memory_can_run_as_two_tasks(self) -> None:
+        logs_dir = self.workspace / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "2026-04-01.md").write_text(
+            "### 09:00:00\n"
+            "**Q:** Remember the release style.\n\n"
+            "**A:** Stored the release style.\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "app.memory.consolidate._generate_semantic_summary",
+            return_value=SummaryGenerationResult(
+                text=(
+                    "## 2026-04-01\n"
+                    "### Semantic Summary\n"
+                    "- Summarized 2026-04-01.\n"
+                    "### Potential Long-Term Notes\n"
+                    "- Prefer concise release notes.\n"
+                )
+            ),
+        ):
+            generate_workspace_summaries(self.workspace, config=self.config)
+
+        summaries = _load_all_valid_summaries(self.workspace / "summaries")
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0].log_date, "2026-04-01")
+
+        merge_workspace_memory(self.workspace, config=self.config)
+        memory_text = (self.workspace / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertIn("Prefer concise release notes.", memory_text)
 
     def test_read_snapshot_refreshes_when_memory_or_summaries_change(self) -> None:
         (self.workspace / "MEMORY.md").write_text(

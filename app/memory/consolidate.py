@@ -107,7 +107,20 @@ class ConsolidationState:
             self.log_hashes = {}
 
 
+@dataclass(slots=True)
+class GeneratedSummaryUpdate:
+    log_date: str
+    content_hash: str
+    summary_block: str
+    parsed: ParsedSummary | None
+
+
 def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = None) -> None:
+    generate_workspace_summaries(workspace, config=config)
+    merge_workspace_memory(workspace, config=config)
+
+
+def generate_workspace_summaries(workspace: Path, config: AppConfig | None = None) -> None:
     logs_dir = workspace / "logs"
     if not logs_dir.exists():
         return
@@ -127,15 +140,37 @@ def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = Non
     }
     state = _load_consolidation_state(workspace)
     summary_map = dict(existing_summary_blocks)
-    memory_file = workspace / "MEMORY.md"
-    memory_sections = _read_memory_sections(memory_file)
-    metadata_updates = {name: {} for name in MEMORY_SECTIONS}
-    section_seen = {
-        name: {_normalize_item(item) for item in items}
-        for name, items in memory_sections.items()
-    }
-    last_processed_log = state.last_consolidated_log
     log_files = sorted(logs_dir.glob("*.md"))
+
+    generated_updates, last_processed_log = _generate_summary_updates(
+        workspace=workspace,
+        log_files=log_files,
+        existing_valid_summaries=existing_valid_summaries,
+        state=state,
+        config=config,
+    )
+    _apply_summary_updates(summary_file, summary_map, generated_updates)
+
+    if last_processed_log:
+        state.last_consolidated_log = last_processed_log
+    _write_consolidation_state(workspace, state)
+
+
+def merge_workspace_memory(workspace: Path, config: AppConfig | None = None) -> None:
+    summaries = _load_all_valid_summaries(workspace / "summaries")
+    _merge_parsed_summaries_into_memory(workspace, summaries, config=config)
+
+
+def _generate_summary_updates(
+    *,
+    workspace: Path,
+    log_files: list[Path],
+    existing_valid_summaries: dict[str, ParsedSummary],
+    state: ConsolidationState,
+    config: AppConfig | None,
+) -> tuple[list[GeneratedSummaryUpdate], str]:
+    updates: list[GeneratedSummaryUpdate] = []
+    last_processed_log = state.last_consolidated_log
 
     for log_file in log_files:
         content = log_file.read_text(encoding="utf-8").strip()
@@ -144,8 +179,7 @@ def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = Non
 
         log_date = log_file.stem
         content_hash = _content_hash(content)
-        should_process = _should_process_log(log_date, content_hash, state)
-        if not should_process:
+        if not _should_process_log(log_date, content_hash, state):
             if log_date > last_processed_log:
                 last_processed_log = log_date
             continue
@@ -157,7 +191,6 @@ def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = Non
             config=config,
         )
         parsed = _parse_summary(log_date, generation.text)
-
         if parsed is None:
             preserved = existing_valid_summaries.get(log_date)
             summary_block = preserved.to_markdown() if preserved is not None else _fallback_summary(
@@ -165,60 +198,108 @@ def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = Non
                 content,
                 reason="invalid summary structure",
             )
-            _upsert_summary_block(summary_file, log_date, summary_block, summary_map)
-            state.log_hashes[log_date] = content_hash
-            if log_date > last_processed_log:
-                last_processed_log = log_date
-            continue
-
-        if generation.is_fallback:
+            updates.append(
+                GeneratedSummaryUpdate(
+                    log_date=log_date,
+                    content_hash=content_hash,
+                    summary_block=summary_block,
+                    parsed=None,
+                )
+            )
+        elif generation.is_fallback:
             preserved = existing_valid_summaries.get(log_date)
-            summary_block = preserved.to_markdown() if preserved is not None else generation.text
-            _upsert_summary_block(summary_file, log_date, summary_block, summary_map)
-            state.log_hashes[log_date] = content_hash
-            if log_date > last_processed_log:
-                last_processed_log = log_date
-            continue
+            updates.append(
+                GeneratedSummaryUpdate(
+                    log_date=log_date,
+                    content_hash=content_hash,
+                    summary_block=preserved.to_markdown() if preserved is not None else generation.text,
+                    parsed=None,
+                )
+            )
+        else:
+            updates.append(
+                GeneratedSummaryUpdate(
+                    log_date=log_date,
+                    content_hash=content_hash,
+                    summary_block=parsed.to_markdown(),
+                    parsed=parsed,
+                )
+            )
 
-        summary_block = parsed.to_markdown()
-        _upsert_summary_block(summary_file, log_date, summary_block, summary_map)
         state.log_hashes[log_date] = content_hash
         if log_date > last_processed_log:
             last_processed_log = log_date
-        for candidate in parsed.potential_long_term_notes[:MAX_LONG_TERM_NOTES]:
+
+    return updates, last_processed_log
+
+
+def _apply_summary_updates(
+    summary_file: Path,
+    summary_map: dict[str, str],
+    updates: list[GeneratedSummaryUpdate],
+) -> None:
+    summary_file.parent.mkdir(parents=True, exist_ok=True)
+    for update in updates:
+        _upsert_summary_block(summary_file, update.log_date, update.summary_block, summary_map)
+
+
+def _merge_generated_notes_into_memory(
+    workspace: Path,
+    updates: list[GeneratedSummaryUpdate],
+    *,
+    config: AppConfig | None,
+) -> None:
+    parsed_summaries = [update.parsed for update in updates if update.parsed is not None]
+    _merge_parsed_summaries_into_memory(workspace, parsed_summaries, config=config)
+
+
+def _merge_parsed_summaries_into_memory(
+    workspace: Path,
+    summaries: list[ParsedSummary],
+    *,
+    config: AppConfig | None,
+) -> None:
+    memory_file = workspace / "MEMORY.md"
+    memory_sections = _read_memory_sections(memory_file)
+    metadata_updates = {name: {} for name in MEMORY_SECTIONS}
+    section_seen = {
+        name: {_normalize_item(item) for item in items}
+        for name, items in memory_sections.items()
+    }
+
+    for summary in summaries:
+        for candidate in summary.potential_long_term_notes[:MAX_LONG_TERM_NOTES]:
             normalized = _normalize_item(candidate)
             if not normalized:
                 continue
             classification = _classify_note_semantics(
                 normalized,
-                source=f"summary:{log_date}",
+                source=f"summary:{summary.log_date}",
                 config=config,
                 workspace=workspace,
             )
             target_section = classification.section
-            if normalized not in section_seen[target_section]:
-                memory_sections[target_section].append(normalized)
-                section_seen[target_section].add(normalized)
-                metadata_updates[target_section][normalized] = _build_note_metadata(
-                    normalized,
-                    classification=classification,
-                    source=f"summary:{log_date}",
-                )
+            if normalized in section_seen[target_section]:
+                continue
+            memory_sections[target_section].append(normalized)
+            section_seen[target_section].add(normalized)
+            metadata_updates[target_section][normalized] = _build_note_metadata(
+                normalized,
+                classification=classification,
+                source=f"summary:{summary.log_date}",
+            )
 
-    if memory_file.exists() or any(items for items in memory_sections.values()):
-        if not memory_file.exists():
-            memory_file.write_text("# Memory\n\n## User Preferences\n\n## Stable Facts\n\n## Saved Notes\n", encoding="utf-8")
-        _rewrite_memory_sections(
-            memory_file,
-            memory_sections,
-            config=config,
-            workspace=workspace,
-            metadata_updates=metadata_updates,
-        )
-
-    if last_processed_log:
-        state.last_consolidated_log = last_processed_log
-    _write_consolidation_state(workspace, state)
+    if not (memory_file.exists() or any(items for items in memory_sections.values())):
+        return
+    if not memory_file.exists():
+        memory_file.write_text("# Memory\n\n## User Preferences\n\n## Stable Facts\n\n## Saved Notes\n", encoding="utf-8")
+    _rewrite_memory_sections(
+        memory_file,
+        memory_sections,
+        config=config,
+        workspace=workspace,
+        metadata_updates=metadata_updates,
+    )
 
 
 def _generate_semantic_summary(
@@ -734,6 +815,19 @@ def _parse_dedupe_decision(text: str) -> dict[str, object] | None:
         "duplicate_of": duplicate_of,
         "canonical": canonical or "",
     }
+
+
+def _load_all_valid_summaries(summaries_dir: Path) -> list[ParsedSummary]:
+    if not summaries_dir.exists():
+        return []
+
+    summaries: list[ParsedSummary] = []
+    for summary_file in sorted(summaries_dir.glob("*.md")):
+        for log_date, block in _load_existing_summary_blocks(summary_file).items():
+            parsed = _parse_summary(log_date, block)
+            if parsed is not None:
+                summaries.append(parsed)
+    return summaries
 
 
 def _load_existing_valid_summaries(summary_file: Path) -> dict[str, ParsedSummary]:

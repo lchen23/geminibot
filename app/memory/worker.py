@@ -8,7 +8,7 @@ from threading import Lock, Thread
 from typing import Callable
 
 from app.config import AppConfig
-from app.memory.consolidate import consolidate_workspace_memory
+from app.memory.consolidate import generate_workspace_summaries, merge_workspace_memory
 from app.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -75,15 +75,29 @@ class MemoryWorker:
             )
         )
 
-    def submit_consolidate_workspace_memory(self, conversation_id: str) -> None:
+    def submit_generate_workspace_summaries(self, conversation_id: str) -> None:
         self._submit(
             MemoryTask(
                 conversation_id=conversation_id,
-                description="consolidate_workspace_memory",
-                run=lambda: self._consolidate(conversation_id),
+                description="generate_workspace_summaries",
+                run=lambda: self._generate_workspace_summaries(conversation_id),
                 refresh_snapshot=True,
             )
         )
+
+    def submit_merge_workspace_memory(self, conversation_id: str) -> None:
+        self._submit(
+            MemoryTask(
+                conversation_id=conversation_id,
+                description="merge_workspace_memory",
+                run=lambda: self._merge_workspace_memory(conversation_id),
+                refresh_snapshot=True,
+            )
+        )
+
+    def submit_consolidate_workspace_memory(self, conversation_id: str) -> None:
+        self.submit_generate_workspace_summaries(conversation_id)
+        self.submit_merge_workspace_memory(conversation_id)
 
     def _submit(self, task: MemoryTask) -> None:
         if not self._started:
@@ -126,9 +140,13 @@ class MemoryWorker:
                 queue.task_done()
 
 
-    def _consolidate(self, conversation_id: str) -> None:
+    def _generate_workspace_summaries(self, conversation_id: str) -> None:
         workspace = self.store.get_workspace(conversation_id)
-        consolidate_workspace_memory(workspace, config=self.config)
+        generate_workspace_summaries(workspace, config=self.config)
+
+    def _merge_workspace_memory(self, conversation_id: str) -> None:
+        workspace = self.store.get_workspace(conversation_id)
+        merge_workspace_memory(workspace, config=self.config)
 
     @staticmethod
     def workspace_for_conversation(store: MemoryStore, conversation_id: str) -> Path:
