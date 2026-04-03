@@ -102,29 +102,43 @@ class MemoryStore:
             handle.write(entry)
 
     def save_memory_note(self, conversation_id: str, content: str) -> None:
+        self.save_memory_notes(conversation_id, [content])
+
+    def save_memory_notes(self, conversation_id: str, contents: list[str]) -> None:
         sections = self._read_memory_sections(conversation_id)
-        cleaned = self._normalize_item(content)
-        if not cleaned:
-            return
         workspace = self.get_workspace(conversation_id)
-        classification = _classify_long_term_note(
-            cleaned,
-            source="remember",
-            config=self.config,
-            workspace=workspace,
-        )
-        target_section = classification.section
-        existing = {self._normalize_item(item) for item in sections[target_section]}
-        if cleaned not in existing:
+        seen_by_section = {
+            name: {self._normalize_item(item) for item in sections.get(name, [])}
+            for name in REQUIRED_MEMORY_SECTIONS
+        }
+        metadata_updates = {
+            name: {} for name in REQUIRED_MEMORY_SECTIONS
+        }
+        changed = False
+
+        for content in contents:
+            cleaned = self._normalize_item(content)
+            if not cleaned:
+                continue
+            classification = _classify_long_term_note(
+                cleaned,
+                source="remember",
+                config=self.config,
+                workspace=workspace,
+            )
+            target_section = classification.section
+            if cleaned in seen_by_section[target_section]:
+                continue
+            seen_by_section[target_section].add(cleaned)
             sections[target_section].append(cleaned)
-            metadata_updates = {
-                name: {} for name in REQUIRED_MEMORY_SECTIONS
-            }
             metadata_updates[target_section][cleaned] = _build_note_metadata(
                 cleaned,
                 classification=classification,
                 source="remember",
             )
+            changed = True
+
+        if changed:
             self._write_memory_sections(conversation_id, sections, metadata_updates=metadata_updates)
 
     def read_memory(self, conversation_id: str) -> str:

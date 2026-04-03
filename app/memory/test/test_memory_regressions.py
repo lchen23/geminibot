@@ -5,6 +5,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
+from time import sleep
 from unittest.mock import patch
 
 from app.config import AppConfig
@@ -606,6 +607,34 @@ class MemoryRegressionTests(unittest.TestCase):
             self.assertTrue(self.store.snapshot_matches_workspace(self.conversation_id, recent_summary_days=7))
         finally:
             worker.stop()
+
+    def test_memory_worker_batches_adjacent_save_note_tasks(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        save_batches: list[list[str]] = []
+
+        with patch.object(worker.store, "save_memory_notes") as save_memory_notes:
+            def capture(conversation_id: str, contents: list[str]) -> None:
+                save_batches.append(list(contents))
+                sleep(0.01)
+
+            save_memory_notes.side_effect = capture
+            try:
+                worker.submit_save_memory_note(self.conversation_id, "Prefer concise replies.")
+                worker.submit_save_memory_note(self.conversation_id, "Prefer terse status updates.")
+                worker.submit_save_memory_note(self.conversation_id, "Avoid verbose summaries.")
+                worker.stop()
+            finally:
+                worker.stop()
+
+        self.assertEqual(
+            save_batches,
+            [[
+                "Prefer concise replies.",
+                "Prefer terse status updates.",
+                "Avoid verbose summaries.",
+            ]],
+        )
 
     def test_memory_worker_prioritizes_light_tasks_within_conversation(self) -> None:
         worker = MemoryWorker(self.config)

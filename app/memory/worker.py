@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
-from queue import PriorityQueue
+from queue import Empty, PriorityQueue
 from threading import Lock, Thread
 from typing import Callable
 
@@ -28,6 +28,7 @@ class MemoryTask:
     run: Callable[[], None]
     refresh_snapshot: bool = False
     priority: int = TASK_PRIORITY_SAVE_NOTE
+    note_content: str | None = None
 
 
 class MemoryWorker:
@@ -80,9 +81,10 @@ class MemoryWorker:
             MemoryTask(
                 conversation_id=conversation_id,
                 description="save_memory_note",
-                run=lambda: self.store.save_memory_note(conversation_id, content),
+                run=lambda: self.store.save_memory_notes(conversation_id, [content]),
                 refresh_snapshot=True,
                 priority=TASK_PRIORITY_SAVE_NOTE,
+                note_content=content,
             )
         )
 
@@ -140,7 +142,27 @@ class MemoryWorker:
             try:
                 if task is None:
                     return
-                task.run()
+                if task.description == "save_memory_note" and task.note_content is not None:
+                    batch = [task.note_content]
+                    while True:
+                        try:
+                            _, _, queued_task = queue.get_nowait()
+                        except Empty:
+                            break
+                        if queued_task is None:
+                            queue.put((TASK_PRIORITY_MERGE_MEMORY + 1, next(self._sequence), None))
+                            queue.task_done()
+                            continue
+                        if queued_task.description == "save_memory_note" and queued_task.note_content is not None:
+                            batch.append(queued_task.note_content)
+                            queue.task_done()
+                            continue
+                        queue.put((queued_task.priority, next(self._sequence), queued_task))
+                        queue.task_done()
+                        break
+                    self.store.save_memory_notes(task.conversation_id, batch)
+                else:
+                    task.run()
                 if task.refresh_snapshot:
                     self.store.refresh_snapshot(task.conversation_id)
             except Exception:  # pragma: no cover - defensive logging
