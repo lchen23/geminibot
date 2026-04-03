@@ -66,8 +66,30 @@ Current config loading and defaulting live in `app/config.py:30`.
 Start the service:
 
 ```bash
-python -m app.main
+geminibot start
 ```
+
+Foreground mode:
+
+```bash
+geminibot start --foreground
+```
+
+Stop the service:
+
+```bash
+geminibot stop
+```
+
+Check status:
+
+```bash
+geminibot status
+```
+
+The CLI stores runtime state under `DATA_ROOT/runtime/`:
+- `geminibot.pid` — active process id
+- `geminibot.log` — background process log output
 
 Startup flow:
 1. Load environment and initialize data/workspace directories
@@ -76,8 +98,9 @@ Startup flow:
 4. Create Dispatcher, Feishu gateway, and scheduler loop
 5. Start scheduler polling thread
 6. Start Feishu WebSocket client when credentials are present
+7. On shutdown, stop the gateway thread and scheduler loop cleanly
 
-See `app/main.py:10`.
+See `app/main.py:12` and `app/cli.py:1`.
 
 ## Operator Runbook
 

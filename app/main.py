@@ -10,7 +10,7 @@ from app.utils.logging import configure_logging
 logger = logging.getLogger(__name__)
 
 
-def main() -> None:
+def run_service() -> None:
     config = AppConfig.load()
     configure_logging(config.log_level)
     startup = config.run_startup_checks()
@@ -28,7 +28,14 @@ def main() -> None:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
-        pass
+        logger.info("Shutdown signal received.")
+    finally:
+        gateway.stop()
+        scheduler.stop()
+
+
+def main() -> None:
+    run_service()
 
 
 if __name__ == "__main__":

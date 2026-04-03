@@ -33,6 +33,14 @@ class SchedulerLoop:
         self._thread.start()
         logger.info("Scheduler loop started.")
 
+    def stop(self) -> None:
+        if not self._running:
+            return
+        self._running = False
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=self.config.poll_interval_seconds + 1)
+        logger.info("Scheduler loop stopped.")
+
     def _run(self) -> None:
         while self._running:
             self._dispatch_due_tasks()

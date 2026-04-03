@@ -56,8 +56,10 @@ class FeishuGateway:
         self._ws_client: Any | None = None
         self._ws_thread: threading.Thread | None = None
         self._client: Any | None = None
+        self._stop_event = threading.Event()
 
     def start(self) -> None:
+        self._stop_event.clear()
         if not self._has_credentials():
             logger.info("FeishuGateway started in local mode. Use handle_text_message() or CLI simulation to feed messages.")
             return
@@ -67,6 +69,21 @@ class FeishuGateway:
             self._client = Client.builder().app_id(self.config.feishu_app_id).app_secret(self.config.feishu_app_secret).build()
         self._start_websocket_client()
         logger.info("FeishuGateway initialized Feishu client for app_id=%s", self.config.feishu_app_id)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._ws_client is not None:
+            stop = getattr(self._ws_client, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    logger.exception("Failed to stop Feishu WebSocket client cleanly.")
+        if self._ws_thread is not None and self._ws_thread.is_alive():
+            self._ws_thread.join(timeout=5)
+        self._ws_client = None
+        self._ws_thread = None
+        logger.info("FeishuGateway stopped.")
 
     def handle_text_message(
         self,
@@ -315,7 +332,8 @@ class FeishuGateway:
         try:
             self._ws_client.start()
         except Exception:  # pragma: no cover - depends on external SDK/runtime
-            logger.exception("Feishu WebSocket client stopped unexpectedly.")
+            if not self._stop_event.is_set():
+                logger.exception("Feishu WebSocket client stopped unexpectedly.")
 
     def _build_event_handler(self) -> Any:
         handler = EventDispatcherHandler.builder("", "")
