@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from itertools import count
 from pathlib import Path
-from queue import Queue
+from queue import PriorityQueue
 from threading import Lock, Thread
 from typing import Callable
 
@@ -14,22 +15,30 @@ from app.memory.store import MemoryStore
 logger = logging.getLogger(__name__)
 
 
+TASK_PRIORITY_APPEND_LOG = 0
+TASK_PRIORITY_SAVE_NOTE = 1
+TASK_PRIORITY_GENERATE_SUMMARIES = 2
+TASK_PRIORITY_MERGE_MEMORY = 3
+
+
 @dataclass(slots=True)
 class MemoryTask:
     conversation_id: str
     description: str
     run: Callable[[], None]
     refresh_snapshot: bool = False
+    priority: int = TASK_PRIORITY_SAVE_NOTE
 
 
 class MemoryWorker:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.store = MemoryStore(config)
-        self._queues: dict[str, Queue[MemoryTask | None]] = {}
+        self._queues: dict[str, PriorityQueue[tuple[int, int, MemoryTask | None]]] = {}
         self._threads: dict[str, Thread] = {}
         self._started = False
         self._lock = Lock()
+        self._sequence = count()
 
     def start(self) -> None:
         if self._started:
@@ -43,7 +52,7 @@ class MemoryWorker:
             queues = list(self._queues.values())
             threads = list(self._threads.values())
             for queue in queues:
-                queue.put(None)
+                queue.put((TASK_PRIORITY_MERGE_MEMORY + 1, next(self._sequence), None))
         for thread in threads:
             thread.join()
         with self._lock:
@@ -62,6 +71,7 @@ class MemoryWorker:
                     assistant_text=assistant_text,
                 ),
                 refresh_snapshot=False,
+                priority=TASK_PRIORITY_APPEND_LOG,
             )
         )
 
@@ -72,6 +82,7 @@ class MemoryWorker:
                 description="save_memory_note",
                 run=lambda: self.store.save_memory_note(conversation_id, content),
                 refresh_snapshot=True,
+                priority=TASK_PRIORITY_SAVE_NOTE,
             )
         )
 
@@ -82,6 +93,7 @@ class MemoryWorker:
                 description="generate_workspace_summaries",
                 run=lambda: self._generate_workspace_summaries(conversation_id),
                 refresh_snapshot=True,
+                priority=TASK_PRIORITY_GENERATE_SUMMARIES,
             )
         )
 
@@ -92,6 +104,7 @@ class MemoryWorker:
                 description="merge_workspace_memory",
                 run=lambda: self._merge_workspace_memory(conversation_id),
                 refresh_snapshot=True,
+                priority=TASK_PRIORITY_MERGE_MEMORY,
             )
         )
 
@@ -102,14 +115,14 @@ class MemoryWorker:
     def _submit(self, task: MemoryTask) -> None:
         if not self._started:
             raise RuntimeError("MemoryWorker must be started before submitting tasks.")
-        self._queue_for_conversation(task.conversation_id).put(task)
+        self._queue_for_conversation(task.conversation_id).put((task.priority, next(self._sequence), task))
 
-    def _queue_for_conversation(self, conversation_id: str) -> Queue[MemoryTask | None]:
+    def _queue_for_conversation(self, conversation_id: str) -> PriorityQueue[tuple[int, int, MemoryTask | None]]:
         with self._lock:
             queue = self._queues.get(conversation_id)
             if queue is not None:
                 return queue
-            queue = Queue()
+            queue = PriorityQueue()
             thread = Thread(
                 target=self._run_loop,
                 args=(conversation_id, queue),
@@ -121,9 +134,9 @@ class MemoryWorker:
             thread.start()
             return queue
 
-    def _run_loop(self, conversation_id: str, queue: Queue[MemoryTask | None]) -> None:
+    def _run_loop(self, conversation_id: str, queue: PriorityQueue[tuple[int, int, MemoryTask | None]]) -> None:
         while True:
-            task = queue.get()
+            _, _, task = queue.get()
             try:
                 if task is None:
                     return

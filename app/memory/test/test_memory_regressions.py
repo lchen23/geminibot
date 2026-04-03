@@ -24,7 +24,14 @@ from app.memory.consolidate import (
     consolidate_workspace_memory,
 )
 from app.memory.store import MemoryStore
-from app.memory.worker import MemoryTask, MemoryWorker
+from app.memory.worker import (
+    TASK_PRIORITY_APPEND_LOG,
+    TASK_PRIORITY_GENERATE_SUMMARIES,
+    TASK_PRIORITY_MERGE_MEMORY,
+    TASK_PRIORITY_SAVE_NOTE,
+    MemoryTask,
+    MemoryWorker,
+)
 
 
 class MemoryRegressionTests(unittest.TestCase):
@@ -556,6 +563,98 @@ class MemoryRegressionTests(unittest.TestCase):
             self.assertIn("Prefer concise release summaries.", refreshed.memory_text)
             self.assertTrue(self.store.snapshot_matches_workspace(self.conversation_id, recent_summary_days=7))
         finally:
+            worker.stop()
+
+    def test_memory_worker_prioritizes_light_tasks_within_conversation(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        execution: list[str] = []
+        heavy_started = Event()
+        release_heavy = Event()
+        log_done = Event()
+        note_done = Event()
+
+        def make_task(
+            conversation_id: str,
+            label: str,
+            *,
+            priority: int,
+            start_event: Event | None = None,
+            wait_event: Event | None = None,
+            finish_event: Event | None = None,
+        ) -> MemoryTask:
+            def run() -> None:
+                execution.append(f"start:{label}")
+                if start_event is not None:
+                    start_event.set()
+                if wait_event is not None:
+                    wait_event.wait(timeout=2)
+                execution.append(f"end:{label}")
+                if finish_event is not None:
+                    finish_event.set()
+
+            return MemoryTask(
+                conversation_id=conversation_id,
+                description=label,
+                run=run,
+                priority=priority,
+            )
+
+        try:
+            worker._submit(
+                make_task(
+                    "conv-1",
+                    "heavy-merge",
+                    priority=TASK_PRIORITY_MERGE_MEMORY,
+                    start_event=heavy_started,
+                    wait_event=release_heavy,
+                )
+            )
+            self.assertTrue(heavy_started.wait(timeout=2))
+
+            worker._submit(
+                make_task(
+                    "conv-1",
+                    "append-log",
+                    priority=TASK_PRIORITY_APPEND_LOG,
+                    finish_event=log_done,
+                )
+            )
+            worker._submit(
+                make_task(
+                    "conv-1",
+                    "save-note",
+                    priority=TASK_PRIORITY_SAVE_NOTE,
+                    finish_event=note_done,
+                )
+            )
+            worker._submit(
+                make_task(
+                    "conv-1",
+                    "generate-summaries",
+                    priority=TASK_PRIORITY_GENERATE_SUMMARIES,
+                )
+            )
+
+            release_heavy.set()
+            self.assertTrue(log_done.wait(timeout=2))
+            self.assertTrue(note_done.wait(timeout=2))
+
+            self.assertEqual(
+                execution,
+                [
+                    "start:heavy-merge",
+                    "end:heavy-merge",
+                    "start:append-log",
+                    "end:append-log",
+                    "start:save-note",
+                    "end:save-note",
+                    "start:generate-summaries",
+                    "end:generate-summaries",
+                ],
+            )
+        finally:
+            release_heavy.set()
             worker.stop()
 
     def test_memory_worker_serializes_within_conversation_but_not_globally(self) -> None:
