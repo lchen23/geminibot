@@ -11,6 +11,7 @@ from app.memory.consolidate import (
     SummaryGenerationResult,
     _apply_retention_policy,
     _fallback_summary,
+    _load_consolidation_state,
     _load_memory_metadata,
     _semantic_dedupe_entries,
     consolidate_workspace_memory,
@@ -309,6 +310,106 @@ class MemoryRegressionTests(unittest.TestCase):
         rewritten = summary_file.read_text(encoding="utf-8")
         self.assertIn("- Stored a durable release style preference.", rewritten)
         self.assertNotIn("Semantic summary unavailable", rewritten)
+
+    def test_consolidate_only_processes_new_or_changed_logs(self) -> None:
+        logs_dir = self.workspace / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "2026-04-01.md").write_text(
+            "### 09:00:00\n"
+            "**Q:** Remember the release style.\n\n"
+            "**A:** Stored the release style.\n",
+            encoding="utf-8",
+        )
+
+        call_log: list[str] = []
+
+        def fake_generate(log_date: str, log_content: str, workspace: Path, config: AppConfig | None) -> SummaryGenerationResult:
+            call_log.append(log_date)
+            return SummaryGenerationResult(
+                text=(
+                    f"## {log_date}\n"
+                    "### Semantic Summary\n"
+                    f"- Summarized {log_date}.\n"
+                    "### Potential Long-Term Notes\n"
+                    "- None\n"
+                )
+            )
+
+        with patch("app.memory.consolidate._generate_semantic_summary", side_effect=fake_generate):
+            consolidate_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(call_log, ["2026-04-01"])
+
+            consolidate_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(call_log, ["2026-04-01"])
+
+            (logs_dir / "2026-04-02.md").write_text(
+                "### 10:00:00\n"
+                "**Q:** What changed today?\n\n"
+                "**A:** Captured today's update.\n",
+                encoding="utf-8",
+            )
+            consolidate_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(call_log, ["2026-04-01", "2026-04-02"])
+
+            (logs_dir / "2026-04-01.md").write_text(
+                "### 09:00:00\n"
+                "**Q:** Remember the release style.\n\n"
+                "**A:** Stored the updated release style.\n",
+                encoding="utf-8",
+            )
+            consolidate_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(call_log, ["2026-04-01", "2026-04-02", "2026-04-01"])
+
+        state = _load_consolidation_state(self.workspace)
+        self.assertEqual(state.last_consolidated_log, "2026-04-02")
+        self.assertIn("2026-04-01", state.log_hashes)
+        self.assertIn("2026-04-02", state.log_hashes)
+
+    def test_consolidate_appends_new_summary_block_without_rewriting_existing_blocks(self) -> None:
+        logs_dir = self.workspace / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "2026-04-01.md").write_text(
+            "### 09:00:00\n"
+            "**Q:** Save a note.\n\n"
+            "**A:** Saved it.\n",
+            encoding="utf-8",
+        )
+        (logs_dir / "2026-04-02.md").write_text(
+            "### 09:00:00\n"
+            "**Q:** Save another note.\n\n"
+            "**A:** Saved it too.\n",
+            encoding="utf-8",
+        )
+        summary_file = self.workspace / "summaries" / f"{date.today().isoformat()}.md"
+        summary_file.parent.mkdir(parents=True, exist_ok=True)
+        summary_file.write_text(
+            "## 2026-04-01\n"
+            "### Semantic Summary\n"
+            "- Existing summary block.\n"
+            "### Potential Long-Term Notes\n"
+            "- None\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "app.memory.consolidate._generate_semantic_summary",
+            return_value=SummaryGenerationResult(
+                text=(
+                    "## 2026-04-02\n"
+                    "### Semantic Summary\n"
+                    "- Appended summary block.\n"
+                    "### Potential Long-Term Notes\n"
+                    "- None\n"
+                )
+            ),
+        ):
+            consolidate_workspace_memory(self.workspace, config=self.config)
+
+        rewritten = summary_file.read_text(encoding="utf-8")
+        self.assertIn("## 2026-04-01", rewritten)
+        self.assertIn("- Existing summary block.", rewritten)
+        self.assertIn("## 2026-04-02", rewritten)
+        self.assertIn("- Appended summary block.", rewritten)
 
 
 if __name__ == "__main__":

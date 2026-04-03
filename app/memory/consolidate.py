@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -96,6 +97,16 @@ class ParsedSummary:
         return "\n".join(lines)
 
 
+@dataclass(slots=True)
+class ConsolidationState:
+    last_consolidated_log: str = ""
+    log_hashes: dict[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.log_hashes is None:
+            self.log_hashes = {}
+
+
 def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = None) -> None:
     logs_dir = workspace / "logs"
     if not logs_dir.exists():
@@ -104,9 +115,18 @@ def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = Non
     summaries_dir = workspace / "summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
     summary_file = summaries_dir / f"{date.today().isoformat()}.md"
-    existing_valid_summaries = _load_existing_valid_summaries(summary_file)
-
-    summary_sections: list[str] = []
+    existing_summary_blocks = _load_existing_summary_blocks(summary_file)
+    existing_valid_summaries = {
+        log_date: _parse_summary(log_date, block)
+        for log_date, block in existing_summary_blocks.items()
+    }
+    existing_valid_summaries = {
+        log_date: parsed
+        for log_date, parsed in existing_valid_summaries.items()
+        if parsed is not None
+    }
+    state = _load_consolidation_state(workspace)
+    summary_map = dict(existing_summary_blocks)
     memory_file = workspace / "MEMORY.md"
     memory_sections = _read_memory_sections(memory_file)
     metadata_updates = {name: {} for name in MEMORY_SECTIONS}
@@ -114,59 +134,76 @@ def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = Non
         name: {_normalize_item(item) for item in items}
         for name, items in memory_sections.items()
     }
+    last_processed_log = state.last_consolidated_log
+    log_files = sorted(logs_dir.glob("*.md"))
 
-    for log_file in sorted(logs_dir.glob("*.md")):
+    for log_file in log_files:
         content = log_file.read_text(encoding="utf-8").strip()
         if not content:
             continue
 
+        log_date = log_file.stem
+        content_hash = _content_hash(content)
+        should_process = _should_process_log(log_date, content_hash, state)
+        if not should_process:
+            if log_date > last_processed_log:
+                last_processed_log = log_date
+            continue
+
         generation = _generate_semantic_summary(
-            log_date=log_file.stem,
+            log_date=log_date,
             log_content=content,
             workspace=workspace,
             config=config,
         )
-        parsed = _parse_summary(log_file.stem, generation.text)
+        parsed = _parse_summary(log_date, generation.text)
 
         if parsed is None:
-            preserved = existing_valid_summaries.get(log_file.stem)
-            if preserved is not None:
-                summary_sections.append(preserved.to_markdown())
-                continue
-            summary_sections.append(_fallback_summary(log_file.stem, content, reason="invalid summary structure"))
+            preserved = existing_valid_summaries.get(log_date)
+            summary_block = preserved.to_markdown() if preserved is not None else _fallback_summary(
+                log_date,
+                content,
+                reason="invalid summary structure",
+            )
+            _upsert_summary_block(summary_file, log_date, summary_block, summary_map)
+            state.log_hashes[log_date] = content_hash
+            if log_date > last_processed_log:
+                last_processed_log = log_date
             continue
 
         if generation.is_fallback:
-            preserved = existing_valid_summaries.get(log_file.stem)
-            if preserved is not None:
-                summary_sections.append(preserved.to_markdown())
-                continue
-            summary_sections.append(generation.text)
+            preserved = existing_valid_summaries.get(log_date)
+            summary_block = preserved.to_markdown() if preserved is not None else generation.text
+            _upsert_summary_block(summary_file, log_date, summary_block, summary_map)
+            state.log_hashes[log_date] = content_hash
+            if log_date > last_processed_log:
+                last_processed_log = log_date
             continue
 
-        summary_sections.append(parsed.to_markdown())
+        summary_block = parsed.to_markdown()
+        _upsert_summary_block(summary_file, log_date, summary_block, summary_map)
+        state.log_hashes[log_date] = content_hash
+        if log_date > last_processed_log:
+            last_processed_log = log_date
         for candidate in parsed.potential_long_term_notes[:MAX_LONG_TERM_NOTES]:
             normalized = _normalize_item(candidate)
             if not normalized:
                 continue
             classification = _classify_note_semantics(
                 normalized,
-                source=f"summary:{log_file.stem}",
+                source=f"summary:{log_date}",
                 config=config,
                 workspace=workspace,
             )
             target_section = classification.section
-            if normalized and normalized not in section_seen[target_section]:
+            if normalized not in section_seen[target_section]:
                 memory_sections[target_section].append(normalized)
                 section_seen[target_section].add(normalized)
                 metadata_updates[target_section][normalized] = _build_note_metadata(
                     normalized,
                     classification=classification,
-                    source=f"summary:{log_file.stem}",
+                    source=f"summary:{log_date}",
                 )
-
-    if summary_sections:
-        summary_file.write_text("\n\n".join(summary_sections).rstrip() + "\n", encoding="utf-8")
 
     if memory_file.exists() or any(items for items in memory_sections.values()):
         if not memory_file.exists():
@@ -178,6 +215,10 @@ def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = Non
             workspace=workspace,
             metadata_updates=metadata_updates,
         )
+
+    if last_processed_log:
+        state.last_consolidated_log = last_processed_log
+    _write_consolidation_state(workspace, state)
 
 
 def _generate_semantic_summary(
@@ -700,14 +741,123 @@ def _load_existing_valid_summaries(summary_file: Path) -> dict[str, ParsedSummar
         return {}
 
     summaries: dict[str, ParsedSummary] = {}
-    for block in _split_summary_blocks(summary_file.read_text(encoding="utf-8")):
-        log_date = _extract_log_date(block)
-        if not log_date:
-            continue
+    for log_date, block in _load_existing_summary_blocks(summary_file).items():
         parsed = _parse_summary(log_date, block)
         if parsed is not None:
             summaries[log_date] = parsed
     return summaries
+
+
+def _load_existing_summary_blocks(summary_file: Path) -> dict[str, str]:
+    if not summary_file.exists():
+        return {}
+
+    summaries: dict[str, str] = {}
+    for block in _split_summary_blocks(summary_file.read_text(encoding="utf-8")):
+        log_date = _extract_log_date(block)
+        if not log_date:
+            continue
+        summaries[log_date] = block.strip()
+    return summaries
+
+
+def _serialize_summary_map(summary_map: dict[str, str]) -> dict[str, str]:
+    return {
+        log_date: summary_map[log_date].strip()
+        for log_date in sorted(summary_map)
+        if _normalize_item(summary_map[log_date])
+    }
+
+
+def _write_summary_map(summary_file: Path, summary_map: dict[str, str]) -> None:
+    serialized = _serialize_summary_map(summary_map)
+    if not serialized:
+        return
+    summary_file.write_text("\n\n".join(serialized[log_date] for log_date in serialized).rstrip() + "\n", encoding="utf-8")
+
+
+def _upsert_summary_block(summary_file: Path, log_date: str, block: str, summary_map: dict[str, str]) -> None:
+    normalized_block = block.strip()
+    if not normalized_block:
+        return
+    existing_block = _normalize_item(summary_map.get(log_date, ""))
+    if existing_block == _normalize_item(normalized_block):
+        return
+
+    if log_date not in summary_map and _can_append_summary_block(summary_file, log_date, summary_map):
+        with summary_file.open("a", encoding="utf-8") as handle:
+            if summary_file.stat().st_size > 0:
+                handle.write("\n\n")
+            handle.write(normalized_block.rstrip() + "\n")
+        summary_map[log_date] = normalized_block
+        return
+
+    summary_map[log_date] = normalized_block
+    _write_summary_map(summary_file, summary_map)
+
+
+def _can_append_summary_block(summary_file: Path, log_date: str, summary_map: dict[str, str]) -> bool:
+    if not summary_file.exists():
+        return True
+    if not summary_map:
+        return True
+    return log_date > max(summary_map)
+
+
+def _consolidation_state_file(workspace: Path) -> Path:
+    return workspace / "summaries" / "consolidation_state.json"
+
+
+def _load_consolidation_state(workspace: Path) -> ConsolidationState:
+    state_file = _consolidation_state_file(workspace)
+    if not state_file.exists():
+        return ConsolidationState()
+
+    try:
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return ConsolidationState()
+    if not isinstance(payload, dict):
+        return ConsolidationState()
+
+    last_consolidated_log = _normalize_item(str(payload.get("last_consolidated_log", "")))
+    raw_log_hashes = payload.get("log_hashes", {})
+    log_hashes: dict[str, str] = {}
+    if isinstance(raw_log_hashes, dict):
+        for log_date, content_hash in raw_log_hashes.items():
+            normalized_log_date = _normalize_item(str(log_date))
+            normalized_hash = _normalize_item(str(content_hash))
+            if normalized_log_date and normalized_hash:
+                log_hashes[normalized_log_date] = normalized_hash
+    return ConsolidationState(
+        last_consolidated_log=last_consolidated_log,
+        log_hashes=log_hashes,
+    )
+
+
+def _write_consolidation_state(workspace: Path, state: ConsolidationState) -> None:
+    state_file = _consolidation_state_file(workspace)
+    payload = {
+        "version": 1,
+        "last_consolidated_log": state.last_consolidated_log,
+        "log_hashes": {
+            log_date: content_hash
+            for log_date, content_hash in sorted((state.log_hashes or {}).items())
+            if log_date and content_hash
+        },
+    }
+    state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _should_process_log(log_date: str, content_hash: str, state: ConsolidationState) -> bool:
+    previous_hash = (state.log_hashes or {}).get(log_date)
+    if previous_hash != content_hash:
+        return True
+    return log_date > state.last_consolidated_log
 
 
 def _split_summary_blocks(text: str) -> list[str]:
