@@ -2,24 +2,54 @@
 .env
 .venv/
 venv/
+env/
+.python-version
 
-# Python
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.pyc.*
+*.py,cover
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
 
-# Build artifacts
+# Packaging and build artifacts
 build/
 dist/
+site/
+.eggs/
+*.egg
 *.egg-info/
+pip-wheel-metadata/
+
+# IDE and editor files
+.vscode/
+.idea/
 
 # OS files
 .DS_Store
 
+# Tool-local state
+.gemini/
+
 # Runtime state
 workspaces/
-data/*.json
+data/
+
+# Local docs and validation notes
+notes/
+specs/
+
+# Local docs and validation notes
+notes/
+specs/
