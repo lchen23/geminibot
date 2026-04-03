@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
+from threading import Lock
+from typing import ClassVar
 
 from app.config import AppConfig
 from app.memory.consolidate import (
@@ -65,7 +67,17 @@ class SearchHit:
     layer: str
 
 
+@dataclass(slots=True)
+class MemorySnapshot:
+    memory_text: str
+    recent_summaries_text: str
+    signature: tuple[tuple[str, int], ...]
+
+
 class MemoryStore:
+    _snapshot_cache: ClassVar[dict[tuple[str, int], MemorySnapshot]] = {}
+    _snapshot_lock: ClassVar[Lock] = Lock()
+
     def __init__(self, config: AppConfig) -> None:
         self.config = config
 
@@ -163,6 +175,56 @@ class MemoryStore:
         files = sorted(summaries_dir.glob("*.md"), reverse=True)[:days]
         return "\n\n".join(path.read_text(encoding="utf-8").strip() for path in files if path.exists())
 
+    def read_snapshot(self, conversation_id: str, recent_summary_days: int) -> MemorySnapshot:
+        cache_key = (conversation_id, recent_summary_days)
+        workspace = self.get_workspace(conversation_id)
+        signature = self._snapshot_signature(workspace, recent_summary_days)
+        with self._snapshot_lock:
+            cached = self._snapshot_cache.get(cache_key)
+            if cached is not None and cached.signature == signature:
+                return cached
+
+        snapshot = MemorySnapshot(
+            memory_text=self.read_memory(conversation_id).strip(),
+            recent_summaries_text=self.read_recent_summaries(workspace=workspace, days=recent_summary_days).strip(),
+            signature=signature,
+        )
+        with self._snapshot_lock:
+            self._snapshot_cache[cache_key] = snapshot
+        return snapshot
+
+    def refresh_snapshot(self, conversation_id: str) -> MemorySnapshot:
+        workspace = self.get_workspace(conversation_id)
+        memory_text = self.read_memory(conversation_id).strip()
+        snapshots: dict[tuple[str, int], MemorySnapshot] = {}
+        with self._snapshot_lock:
+            days_values = {days for cached_conversation_id, days in self._snapshot_cache if cached_conversation_id == conversation_id}
+        if not days_values:
+            days_values = {self.config.recent_summary_days}
+        for days in days_values:
+            snapshots[(conversation_id, days)] = MemorySnapshot(
+                memory_text=memory_text,
+                recent_summaries_text=self.read_recent_summaries(workspace=workspace, days=days).strip(),
+                signature=self._snapshot_signature(workspace, days),
+            )
+        with self._snapshot_lock:
+            self._snapshot_cache.update(snapshots)
+        return snapshots[(conversation_id, self.config.recent_summary_days)]
+
+    def invalidate_snapshot(self, conversation_id: str) -> None:
+        with self._snapshot_lock:
+            stale_keys = [key for key in self._snapshot_cache if key[0] == conversation_id]
+            for key in stale_keys:
+                self._snapshot_cache.pop(key, None)
+
+    def snapshot_matches_workspace(self, conversation_id: str, recent_summary_days: int) -> bool:
+        cache_key = (conversation_id, recent_summary_days)
+        workspace = self.get_workspace(conversation_id)
+        current_signature = self._snapshot_signature(workspace, recent_summary_days)
+        with self._snapshot_lock:
+            cached = self._snapshot_cache.get(cache_key)
+        return cached is not None and cached.signature == current_signature
+
     def search(self, conversation_id: str, query: str, limit: int = 10) -> list[str]:
         workspace = self.get_workspace(conversation_id)
         normalized_query = self._normalize_item(query)
@@ -199,6 +261,20 @@ class MemoryStore:
         workspace = self.config.workspace_root / conversation_id
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
+
+    def _snapshot_signature(self, workspace: Path, days: int) -> tuple[tuple[str, int], ...]:
+        memory_file = workspace / "MEMORY.md"
+        signatures: list[tuple[str, int]] = []
+        if memory_file.exists():
+            signatures.append(("MEMORY.md", int(memory_file.stat().st_mtime_ns)))
+
+        summaries_dir = workspace / "summaries"
+        if summaries_dir.exists():
+            for path in sorted(summaries_dir.glob("*.md"), reverse=True)[:days]:
+                if path.exists():
+                    relative_name = path.relative_to(workspace).as_posix()
+                    signatures.append((relative_name, int(path.stat().st_mtime_ns)))
+        return tuple(signatures)
 
     def _search_memory_file(self, workspace: Path, query: str) -> list[SearchHit]:
         memory_file = workspace / "MEMORY.md"

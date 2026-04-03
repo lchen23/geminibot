@@ -19,6 +19,7 @@ class MemoryTask:
     conversation_id: str
     description: str
     run: Callable[[], None]
+    refresh_snapshot: bool = False
 
 
 class MemoryWorker:
@@ -60,6 +61,7 @@ class MemoryWorker:
                     user_text=user_text,
                     assistant_text=assistant_text,
                 ),
+                refresh_snapshot=False,
             )
         )
 
@@ -69,6 +71,7 @@ class MemoryWorker:
                 conversation_id=conversation_id,
                 description="save_memory_note",
                 run=lambda: self.store.save_memory_note(conversation_id, content),
+                refresh_snapshot=True,
             )
         )
 
@@ -78,6 +81,7 @@ class MemoryWorker:
                 conversation_id=conversation_id,
                 description="consolidate_workspace_memory",
                 run=lambda: self._consolidate(conversation_id),
+                refresh_snapshot=True,
             )
         )
 
@@ -110,6 +114,8 @@ class MemoryWorker:
                 if task is None:
                     return
                 task.run()
+                if task.refresh_snapshot:
+                    self.store.refresh_snapshot(task.conversation_id)
             except Exception:  # pragma: no cover - defensive logging
                 logger.exception(
                     "Memory task failed: %s for conversation %s",

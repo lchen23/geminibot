@@ -413,6 +413,68 @@ class MemoryRegressionTests(unittest.TestCase):
         self.assertIn("## 2026-04-02", rewritten)
         self.assertIn("- Appended summary block.", rewritten)
 
+    def test_read_snapshot_refreshes_when_memory_or_summaries_change(self) -> None:
+        (self.workspace / "MEMORY.md").write_text(
+            "# Memory\n\n"
+            "## User Preferences\n"
+            "- Prefer concise replies.\n\n"
+            "## Stable Facts\n\n"
+            "## Saved Notes\n",
+            encoding="utf-8",
+        )
+        summaries_dir = self.workspace / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        (summaries_dir / "2026-04-03.md").write_text(
+            "## 2026-04-03\n"
+            "### Semantic Summary\n"
+            "- First summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- None\n",
+            encoding="utf-8",
+        )
+
+        first = self.store.read_snapshot(self.conversation_id, recent_summary_days=7)
+        self.assertIn("Prefer concise replies.", first.memory_text)
+        self.assertIn("First summary.", first.recent_summaries_text)
+
+        (self.workspace / "MEMORY.md").write_text(
+            "# Memory\n\n"
+            "## User Preferences\n"
+            "- Prefer concise replies.\n"
+            "- Prefer short status updates.\n\n"
+            "## Stable Facts\n\n"
+            "## Saved Notes\n",
+            encoding="utf-8",
+        )
+        (summaries_dir / "2026-04-04.md").write_text(
+            "## 2026-04-04\n"
+            "### Semantic Summary\n"
+            "- Updated summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- None\n",
+            encoding="utf-8",
+        )
+
+        refreshed = self.store.read_snapshot(self.conversation_id, recent_summary_days=7)
+        self.assertIn("Prefer short status updates.", refreshed.memory_text)
+        self.assertIn("Updated summary.", refreshed.recent_summaries_text)
+
+    def test_memory_worker_refreshes_snapshot_after_memory_write(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        try:
+            snapshot = self.store.read_snapshot(self.conversation_id, recent_summary_days=7)
+            self.assertNotIn("Prefer concise release summaries.", snapshot.memory_text)
+
+            worker.submit_save_memory_note(self.conversation_id, "Prefer concise release summaries.")
+            worker.stop()
+
+            refreshed = self.store.read_snapshot(self.conversation_id, recent_summary_days=7)
+            self.assertIn("Prefer concise release summaries.", refreshed.memory_text)
+            self.assertTrue(self.store.snapshot_matches_workspace(self.conversation_id, recent_summary_days=7))
+        finally:
+            worker.stop()
+
     def test_memory_worker_serializes_within_conversation_but_not_globally(self) -> None:
         worker = MemoryWorker(self.config)
         worker.start()

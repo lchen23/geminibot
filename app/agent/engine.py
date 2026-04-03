@@ -5,7 +5,8 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from threading import Lock
+from typing import ClassVar, Iterator
 
 from app.agent.session_store import SessionStore
 from app.agent.workspace import WorkspaceManager
@@ -41,7 +42,15 @@ class AgentStreamEvent:
     error: str | None = None
 
 
+@dataclass(slots=True)
+class PromptSnapshot:
+    text: str
+    signature: tuple[tuple[str, bool, int, int], ...]
+
+
 class GeminiAgentEngine:
+    _prompt_snapshot_cache: ClassVar[dict[tuple[str, int], PromptSnapshot]] = {}
+    _prompt_snapshot_lock: ClassVar[Lock] = Lock()
     def __init__(self, config: AppConfig, memory_store: MemoryStore) -> None:
         self.config = config
         self.memory_store = memory_store
@@ -184,22 +193,40 @@ class GeminiAgentEngine:
         self.session_store.delete(conversation_id)
 
     def _build_system_prompt(self, workspace: Path) -> str:
+        conversation_id = workspace.name
+        cache_key = (conversation_id, self.config.recent_summary_days)
+        signature = self._prompt_signature(workspace)
+        with self._prompt_snapshot_lock:
+            cached = self._prompt_snapshot_cache.get(cache_key)
+            if cached is not None and cached.signature == signature:
+                return cached.text
+
+        memory_snapshot = self.memory_store.read_snapshot(
+            conversation_id=conversation_id,
+            recent_summary_days=self.config.recent_summary_days,
+        )
         parts: list[str] = []
-        for filename in ["SOUL.md", "IDENTITY.md", "USER.md", "AGENT.md", "MEMORY.md"]:
+        for filename in ["SOUL.md", "IDENTITY.md", "USER.md", "AGENT.md"]:
             path = workspace / filename
             if path.exists():
                 content = path.read_text(encoding="utf-8").strip()
                 if content:
                     parts.append(f"## {filename}\n{content}")
 
+        if memory_snapshot.memory_text:
+            parts.append(f"## MEMORY.md\n{memory_snapshot.memory_text}")
+
         tool_guide = self._read_tool_guide(workspace)
         if tool_guide:
             parts.append(f"## TOOL_BRIDGE.md\n{tool_guide}")
 
-        recent = self.memory_store.read_recent_summaries(workspace=workspace, days=self.config.recent_summary_days)
-        if recent:
-            parts.append(f"## Recent Summaries\n{recent}")
-        return "\n\n".join(parts)
+        if memory_snapshot.recent_summaries_text:
+            parts.append(f"## Recent Summaries\n{memory_snapshot.recent_summaries_text}")
+
+        snapshot = PromptSnapshot(text="\n\n".join(parts), signature=signature)
+        with self._prompt_snapshot_lock:
+            self._prompt_snapshot_cache[cache_key] = snapshot
+        return snapshot.text
 
     def _build_command(
         self,
@@ -246,6 +273,34 @@ class GeminiAgentEngine:
             }
         )
         return env
+
+    def _prompt_signature(self, workspace: Path) -> tuple[tuple[str, bool, int, int], ...]:
+        files = [
+            "SOUL.md",
+            "IDENTITY.md",
+            "USER.md",
+            "AGENT.md",
+            "MEMORY.md",
+            "tools/README.md",
+        ]
+        signature: list[tuple[str, bool, int, int]] = []
+        for relative_name in files:
+            path = workspace / relative_name
+            if path.exists():
+                stat = path.stat()
+                signature.append((relative_name, True, int(stat.st_mtime_ns), int(stat.st_size)))
+            else:
+                signature.append((relative_name, False, 0, 0))
+
+        summary_snapshot = self.memory_store.read_snapshot(
+            conversation_id=workspace.name,
+            recent_summary_days=self.config.recent_summary_days,
+        )
+        for relative_name, modified_ns in summary_snapshot.signature:
+            summary_path = workspace / relative_name
+            size = int(summary_path.stat().st_size) if summary_path.exists() else 0
+            signature.append((relative_name, summary_path.exists(), modified_ns, size))
+        return tuple(signature)
 
     def _read_tool_guide(self, workspace: Path) -> str:
         guide_path = workspace / "tools" / "README.md"
