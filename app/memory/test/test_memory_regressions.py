@@ -503,6 +503,48 @@ class MemoryRegressionTests(unittest.TestCase):
         memory_text = (self.workspace / "MEMORY.md").read_text(encoding="utf-8")
         self.assertIn("Prefer concise release notes.", memory_text)
 
+    def test_read_recent_summaries_reuses_cache_until_worker_refresh(self) -> None:
+        summaries_dir = self.workspace / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        (summaries_dir / "2026-04-03.md").write_text(
+            "## 2026-04-03\n"
+            "### Semantic Summary\n"
+            "- First summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- None\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(self.store, "_read_recent_summaries_from_disk", wraps=self.store._read_recent_summaries_from_disk) as read_disk:
+            first = self.store.read_recent_summaries(self.workspace, 7)
+            second = self.store.read_recent_summaries(self.workspace, 7)
+
+            self.assertEqual(first, second)
+            self.assertEqual(read_disk.call_count, 1)
+
+            (summaries_dir / "2026-04-04.md").write_text(
+                "## 2026-04-04\n"
+                "### Semantic Summary\n"
+                "- Updated summary.\n"
+                "### Potential Long-Term Notes\n"
+                "- None\n",
+                encoding="utf-8",
+            )
+
+            cached = self.store.read_recent_summaries(self.workspace, 7)
+            self.assertNotIn("Updated summary.", cached)
+            self.assertEqual(read_disk.call_count, 1)
+
+            refreshed = self.store.refresh_recent_summaries(self.conversation_id)
+            self.assertIn(
+                "Updated summary.",
+                refreshed[(str(self.workspace.resolve()), 7)].text,
+            )
+
+            third = self.store.read_recent_summaries(self.workspace, 7)
+            self.assertIn("Updated summary.", third)
+            self.assertEqual(read_disk.call_count, 2)
+
     def test_read_snapshot_refreshes_when_memory_or_summaries_change(self) -> None:
         (self.workspace / "MEMORY.md").write_text(
             "# Memory\n\n"

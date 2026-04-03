@@ -68,6 +68,11 @@ class SearchHit:
 
 
 @dataclass(slots=True)
+class RecentSummariesSnapshot:
+    text: str
+
+
+@dataclass(slots=True)
 class MemorySnapshot:
     memory_text: str
     recent_summaries_text: str
@@ -77,6 +82,8 @@ class MemorySnapshot:
 class MemoryStore:
     _snapshot_cache: ClassVar[dict[tuple[str, int], MemorySnapshot]] = {}
     _snapshot_lock: ClassVar[Lock] = Lock()
+    _recent_summaries_cache: ClassVar[dict[tuple[str, int], RecentSummariesSnapshot]] = {}
+    _recent_summaries_lock: ClassVar[Lock] = Lock()
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -169,20 +176,28 @@ class MemoryStore:
         return summary_file
 
     def read_recent_summaries(self, workspace: Path, days: int) -> str:
-        summaries_dir = workspace / "summaries"
-        if not summaries_dir.exists():
-            return ""
-        files = sorted(summaries_dir.glob("*.md"), reverse=True)[:days]
-        return "\n\n".join(path.read_text(encoding="utf-8").strip() for path in files if path.exists())
+        cache_key = (self._workspace_cache_key(workspace), days)
+        with self._recent_summaries_lock:
+            cached = self._recent_summaries_cache.get(cache_key)
+            if cached is not None:
+                return cached.text
+
+        text = self._read_recent_summaries_from_disk(workspace, days)
+        with self._recent_summaries_lock:
+            self._recent_summaries_cache[cache_key] = RecentSummariesSnapshot(text=text)
+        return text
 
     def read_snapshot(self, conversation_id: str, recent_summary_days: int) -> MemorySnapshot:
-        cache_key = (conversation_id, recent_summary_days)
         workspace = self.get_workspace(conversation_id)
+        cache_key = (self._workspace_cache_key(workspace), recent_summary_days)
         signature = self._snapshot_signature(workspace, recent_summary_days)
         with self._snapshot_lock:
             cached = self._snapshot_cache.get(cache_key)
             if cached is not None and cached.signature == signature:
                 return cached
+
+        if cached is not None:
+            self.refresh_recent_summaries(conversation_id, days_values={recent_summary_days})
 
         snapshot = MemorySnapshot(
             memory_text=self.read_memory(conversation_id).strip(),
@@ -196,30 +211,52 @@ class MemoryStore:
     def refresh_snapshot(self, conversation_id: str) -> MemorySnapshot:
         workspace = self.get_workspace(conversation_id)
         memory_text = self.read_memory(conversation_id).strip()
+        days_values = self._snapshot_days_for_conversation(conversation_id)
+        recent_summaries = self.refresh_recent_summaries(conversation_id, days_values=days_values)
+        workspace_cache_key = self._workspace_cache_key(workspace)
         snapshots: dict[tuple[str, int], MemorySnapshot] = {}
-        with self._snapshot_lock:
-            days_values = {days for cached_conversation_id, days in self._snapshot_cache if cached_conversation_id == conversation_id}
-        if not days_values:
-            days_values = {self.config.recent_summary_days}
         for days in days_values:
-            snapshots[(conversation_id, days)] = MemorySnapshot(
+            snapshots[(workspace_cache_key, days)] = MemorySnapshot(
                 memory_text=memory_text,
-                recent_summaries_text=self.read_recent_summaries(workspace=workspace, days=days).strip(),
+                recent_summaries_text=recent_summaries[(workspace_cache_key, days)].text.strip(),
                 signature=self._snapshot_signature(workspace, days),
             )
         with self._snapshot_lock:
             self._snapshot_cache.update(snapshots)
-        return snapshots[(conversation_id, self.config.recent_summary_days)]
+        return snapshots[(workspace_cache_key, self.config.recent_summary_days)]
+
+    def refresh_recent_summaries(
+        self,
+        conversation_id: str,
+        *,
+        days_values: set[int] | None = None,
+    ) -> dict[tuple[str, int], RecentSummariesSnapshot]:
+        workspace = self.get_workspace(conversation_id)
+        workspace_cache_key = self._workspace_cache_key(workspace)
+        if days_values is None:
+            days_values = self._snapshot_days_for_conversation(conversation_id)
+        refreshed = {
+            (workspace_cache_key, days): RecentSummariesSnapshot(text=self._read_recent_summaries_from_disk(workspace, days))
+            for days in days_values
+        }
+        with self._recent_summaries_lock:
+            self._recent_summaries_cache.update(refreshed)
+        return refreshed
 
     def invalidate_snapshot(self, conversation_id: str) -> None:
+        workspace_cache_key = self._workspace_cache_key(self.get_workspace(conversation_id))
         with self._snapshot_lock:
-            stale_keys = [key for key in self._snapshot_cache if key[0] == conversation_id]
+            stale_keys = [key for key in self._snapshot_cache if key[0] == workspace_cache_key]
             for key in stale_keys:
                 self._snapshot_cache.pop(key, None)
+        with self._recent_summaries_lock:
+            stale_summary_keys = [key for key in self._recent_summaries_cache if key[0] == workspace_cache_key]
+            for key in stale_summary_keys:
+                self._recent_summaries_cache.pop(key, None)
 
     def snapshot_matches_workspace(self, conversation_id: str, recent_summary_days: int) -> bool:
-        cache_key = (conversation_id, recent_summary_days)
         workspace = self.get_workspace(conversation_id)
+        cache_key = (self._workspace_cache_key(workspace), recent_summary_days)
         current_signature = self._snapshot_signature(workspace, recent_summary_days)
         with self._snapshot_lock:
             cached = self._snapshot_cache.get(cache_key)
@@ -275,6 +312,26 @@ class MemoryStore:
                     relative_name = path.relative_to(workspace).as_posix()
                     signatures.append((relative_name, int(path.stat().st_mtime_ns)))
         return tuple(signatures)
+
+    def _snapshot_days_for_conversation(self, conversation_id: str) -> set[int]:
+        workspace_cache_key = self._workspace_cache_key(self.get_workspace(conversation_id))
+        with self._snapshot_lock:
+            days_values = {days for cached_workspace_key, days in self._snapshot_cache if cached_workspace_key == workspace_cache_key}
+        if not days_values:
+            return {self.config.recent_summary_days}
+        days_values.add(self.config.recent_summary_days)
+        return days_values
+
+    @staticmethod
+    def _workspace_cache_key(workspace: Path) -> str:
+        return str(workspace.resolve())
+
+    def _read_recent_summaries_from_disk(self, workspace: Path, days: int) -> str:
+        summaries_dir = workspace / "summaries"
+        if not summaries_dir.exists():
+            return ""
+        files = sorted(summaries_dir.glob("*.md"), reverse=True)[:days]
+        return "\n\n".join(path.read_text(encoding="utf-8").strip() for path in files if path.exists())
 
     def _search_memory_file(self, workspace: Path, query: str) -> list[SearchHit]:
         memory_file = workspace / "MEMORY.md"
