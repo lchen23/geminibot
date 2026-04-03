@@ -4,6 +4,7 @@ import time
 from app.config import AppConfig
 from app.dispatcher import Dispatcher
 from app.gateway.feishu import FeishuGateway
+from app.memory.worker import MemoryWorker
 from app.scheduler.loop import SchedulerLoop
 from app.utils.logging import configure_logging
 
@@ -17,7 +18,9 @@ def run_service() -> None:
     for warning in startup.warnings:
         logger.warning("Startup check warning: %s", warning)
 
-    dispatcher = Dispatcher(config=config)
+    memory_worker = MemoryWorker(config)
+    memory_worker.start()
+    dispatcher = Dispatcher(config=config, memory_worker=memory_worker)
     gateway = FeishuGateway(config=config, dispatcher=dispatcher)
     scheduler = SchedulerLoop(config=config, dispatcher=dispatcher, deliver_message=gateway.deliver)
 
@@ -32,6 +35,7 @@ def run_service() -> None:
     finally:
         gateway.stop()
         scheduler.stop()
+        memory_worker.stop()
 
 
 def main() -> None:

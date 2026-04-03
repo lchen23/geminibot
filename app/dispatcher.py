@@ -6,8 +6,8 @@ from typing import Iterator
 
 from app.agent.engine import GeminiAgentEngine, AgentRequest
 from app.config import AppConfig
-from app.memory.consolidate import consolidate_workspace_memory
 from app.memory.store import MemoryStore
+from app.memory.worker import MemoryWorker
 from app.rendering.cards import build_markdown_reply
 from app.scheduler.store import SchedulerStore
 
@@ -25,9 +25,10 @@ class IncomingMessage:
 
 
 class Dispatcher:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, memory_worker: MemoryWorker) -> None:
         self.config = config
         self.memory_store = MemoryStore(config)
+        self.memory_worker = memory_worker
         self.scheduler_store = SchedulerStore(config)
         self.agent = GeminiAgentEngine(config=config, memory_store=self.memory_store)
 
@@ -104,7 +105,7 @@ class Dispatcher:
             return self._handle_clear(message.conversation_id)
         if text.startswith("/remember "):
             content = text.removeprefix("/remember ").strip()
-            self.memory_store.save_memory_note(message.conversation_id, content)
+            self.memory_worker.submit_save_memory_note(message.conversation_id, content)
             return f"Noted: {content}"
         if text == "/tasks":
             return self._format_tasks(self.scheduler_store.list_tasks(chat_id=message.chat_id))
@@ -117,17 +118,16 @@ class Dispatcher:
         return None
 
     def _append_reply_log(self, message: IncomingMessage, reply: str) -> None:
-        self.memory_store.append_daily_log(
+        self.memory_worker.submit_append_daily_log(
             conversation_id=message.conversation_id,
             user_text=message.text,
             assistant_text=reply,
         )
 
     def _handle_clear(self, conversation_id: str) -> str:
-        workspace = self.memory_store.get_workspace(conversation_id)
-        consolidate_workspace_memory(workspace, config=self.config)
+        self.memory_worker.submit_consolidate_workspace_memory(conversation_id)
         self.agent.clear_conversation(conversation_id)
-        return "Conversation context cleared. Memory was consolidated from current logs."
+        return "Conversation context cleared. Memory consolidation was scheduled."
 
     def _handle_schedule(self, message: IncomingMessage, payload: str) -> str:
         if "|" not in payload:
