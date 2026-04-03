@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 from app.config import AppConfig
@@ -17,6 +18,7 @@ from app.memory.consolidate import (
     consolidate_workspace_memory,
 )
 from app.memory.store import MemoryStore
+from app.memory.worker import MemoryTask, MemoryWorker
 
 
 class MemoryRegressionTests(unittest.TestCase):
@@ -410,6 +412,60 @@ class MemoryRegressionTests(unittest.TestCase):
         self.assertIn("- Existing summary block.", rewritten)
         self.assertIn("## 2026-04-02", rewritten)
         self.assertIn("- Appended summary block.", rewritten)
+
+    def test_memory_worker_serializes_within_conversation_but_not_globally(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        execution: list[str] = []
+        conv1_started = Event()
+        release_conv1 = Event()
+        conv2_finished = Event()
+        conv1_second_finished = Event()
+
+        def make_task(conversation_id: str, label: str, *, start_event: Event | None = None, wait_event: Event | None = None, finish_event: Event | None = None) -> MemoryTask:
+            def run() -> None:
+                execution.append(f"start:{label}")
+                if start_event is not None:
+                    start_event.set()
+                if wait_event is not None:
+                    wait_event.wait(timeout=2)
+                execution.append(f"end:{label}")
+                if finish_event is not None:
+                    finish_event.set()
+
+            return MemoryTask(
+                conversation_id=conversation_id,
+                description=label,
+                run=run,
+            )
+
+        try:
+            worker._submit(make_task("conv-1", "conv1-first", start_event=conv1_started, wait_event=release_conv1))
+            self.assertTrue(conv1_started.wait(timeout=2))
+
+            worker._submit(make_task("conv-1", "conv1-second", finish_event=conv1_second_finished))
+            worker._submit(make_task("conv-2", "conv2-only", finish_event=conv2_finished))
+
+            self.assertTrue(conv2_finished.wait(timeout=2))
+            self.assertEqual(execution, ["start:conv1-first", "start:conv2-only", "end:conv2-only"])
+
+            release_conv1.set()
+            self.assertTrue(conv1_second_finished.wait(timeout=2))
+
+            self.assertEqual(
+                execution,
+                [
+                    "start:conv1-first",
+                    "start:conv2-only",
+                    "end:conv2-only",
+                    "end:conv1-first",
+                    "start:conv1-second",
+                    "end:conv1-second",
+                ],
+            )
+        finally:
+            release_conv1.set()
+            worker.stop()
 
 
 if __name__ == "__main__":

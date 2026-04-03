@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Callable
 
 from app.config import AppConfig
@@ -25,22 +25,30 @@ class MemoryWorker:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.store = MemoryStore(config)
-        self._queue: Queue[MemoryTask | None] = Queue()
-        self._thread = Thread(target=self._run_loop, name="memory-worker", daemon=True)
+        self._queues: dict[str, Queue[MemoryTask | None]] = {}
+        self._threads: dict[str, Thread] = {}
         self._started = False
+        self._lock = Lock()
 
     def start(self) -> None:
         if self._started:
             return
         self._started = True
-        self._thread.start()
 
     def stop(self) -> None:
         if not self._started:
             return
-        self._queue.put(None)
-        self._thread.join()
-        self._started = False
+        with self._lock:
+            queues = list(self._queues.values())
+            threads = list(self._threads.values())
+            for queue in queues:
+                queue.put(None)
+        for thread in threads:
+            thread.join()
+        with self._lock:
+            self._queues.clear()
+            self._threads.clear()
+            self._started = False
 
     def submit_append_daily_log(self, conversation_id: str, user_text: str, assistant_text: str) -> None:
         self._submit(
@@ -76,11 +84,28 @@ class MemoryWorker:
     def _submit(self, task: MemoryTask) -> None:
         if not self._started:
             raise RuntimeError("MemoryWorker must be started before submitting tasks.")
-        self._queue.put(task)
+        self._queue_for_conversation(task.conversation_id).put(task)
 
-    def _run_loop(self) -> None:
+    def _queue_for_conversation(self, conversation_id: str) -> Queue[MemoryTask | None]:
+        with self._lock:
+            queue = self._queues.get(conversation_id)
+            if queue is not None:
+                return queue
+            queue = Queue()
+            thread = Thread(
+                target=self._run_loop,
+                args=(conversation_id, queue),
+                name=f"memory-worker-{conversation_id}",
+                daemon=True,
+            )
+            self._queues[conversation_id] = queue
+            self._threads[conversation_id] = thread
+            thread.start()
+            return queue
+
+    def _run_loop(self, conversation_id: str, queue: Queue[MemoryTask | None]) -> None:
         while True:
-            task = self._queue.get()
+            task = queue.get()
             try:
                 if task is None:
                     return
@@ -92,7 +117,8 @@ class MemoryWorker:
                     task.conversation_id,
                 )
             finally:
-                self._queue.task_done()
+                queue.task_done()
+
 
     def _consolidate(self, conversation_id: str) -> None:
         workspace = self.store.get_workspace(conversation_id)
