@@ -732,6 +732,111 @@ class MemoryRegressionTests(unittest.TestCase):
             ]],
         )
 
+    def test_memory_worker_offloads_summary_generation_and_keeps_light_tasks_responsive(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        heavy_started = Event()
+        release_heavy = Event()
+        log_done = Event()
+        note_done = Event()
+        merge_done = Event()
+        execution: list[str] = []
+
+        def run_heavy(conversation_id: str) -> None:
+            execution.append(f"heavy-start:{conversation_id}")
+            heavy_started.set()
+            release_heavy.wait(timeout=2)
+            execution.append(f"heavy-end:{conversation_id}")
+
+        def append_log(*, conversation_id: str, user_text: str, assistant_text: str) -> None:
+            execution.append("append-log")
+            log_done.set()
+
+        def save_notes(conversation_id: str, contents: list[str]) -> None:
+            execution.append("save-note")
+            note_done.set()
+
+        def merge_memory(conversation_id: str) -> None:
+            execution.append(f"merge:{conversation_id}")
+            merge_done.set()
+
+        with (
+            patch.object(worker, "_run_generate_workspace_summaries", side_effect=run_heavy),
+            patch.object(worker.store, "append_daily_log", side_effect=append_log),
+            patch.object(worker.store, "save_memory_notes", side_effect=save_notes),
+            patch.object(worker.store, "refresh_snapshot"),
+            patch.object(worker, "_merge_workspace_memory", side_effect=merge_memory),
+        ):
+            try:
+                worker.submit_generate_workspace_summaries(self.conversation_id)
+                self.assertTrue(heavy_started.wait(timeout=2))
+
+                worker.submit_append_daily_log(self.conversation_id, "u", "a")
+                worker.submit_save_memory_note(self.conversation_id, "Prefer concise replies.")
+
+                self.assertTrue(log_done.wait(timeout=2))
+                self.assertTrue(note_done.wait(timeout=2))
+                self.assertFalse(merge_done.is_set())
+
+                release_heavy.set()
+                self.assertTrue(merge_done.wait(timeout=2))
+            finally:
+                release_heavy.set()
+                worker.stop()
+
+        self.assertEqual(execution[:3], [f"heavy-start:{self.conversation_id}", "append-log", "save-note"])
+        self.assertEqual(execution[-2:], [f"heavy-end:{self.conversation_id}", f"merge:{self.conversation_id}"])
+
+    def test_memory_worker_coalesces_summary_generation_requests(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        first_started = Event()
+        release_first = Event()
+        second_started = Event()
+        release_second = Event()
+        second_can_run = Event()
+        merge_done = Event()
+        runs: list[str] = []
+
+        def run_heavy(conversation_id: str) -> None:
+            run_number = len(runs) + 1
+            runs.append(f"run-{run_number}:{conversation_id}")
+            if run_number == 1:
+                first_started.set()
+                release_first.wait(timeout=2)
+                second_can_run.set()
+                return
+            second_started.set()
+            release_second.wait(timeout=2)
+
+        def merge_memory(conversation_id: str) -> None:
+            merge_done.set()
+
+        with (
+            patch.object(worker, "_run_generate_workspace_summaries", side_effect=run_heavy),
+            patch.object(worker, "_merge_workspace_memory", side_effect=merge_memory),
+            patch.object(worker.store, "refresh_snapshot"),
+        ):
+            try:
+                worker.submit_generate_workspace_summaries(self.conversation_id)
+                self.assertTrue(first_started.wait(timeout=2))
+
+                worker.submit_generate_workspace_summaries(self.conversation_id)
+                sleep(0.05)
+                self.assertEqual(runs, [f"run-1:{self.conversation_id}"])
+
+                release_first.set()
+                self.assertTrue(second_can_run.wait(timeout=2))
+                self.assertTrue(second_started.wait(timeout=2))
+                release_second.set()
+                self.assertTrue(merge_done.wait(timeout=2))
+            finally:
+                release_first.set()
+                release_second.set()
+                worker.stop()
+
+        self.assertEqual(runs, [f"run-1:{self.conversation_id}", f"run-2:{self.conversation_id}"])
+
     def test_memory_worker_prioritizes_light_tasks_within_conversation(self) -> None:
         worker = MemoryWorker(self.config)
         worker.start()

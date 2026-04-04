@@ -62,14 +62,13 @@ class DispatcherWiringTests(unittest.TestCase):
         )
         self.assertIn("Noted: Prefer concise replies", self._markdown_content(response))
 
-    def test_clear_submits_summary_generation_and_memory_merge_then_clears_agent_context(self) -> None:
+    def test_clear_submits_memory_consolidation_then_clears_agent_context(self) -> None:
         with patch("app.dispatcher.GeminiAgentEngine") as agent_cls:
             dispatcher = Dispatcher(config=self.config, memory_worker=self.memory_worker)
 
         response = dispatcher.handle(self._message("/clear"))
 
-        self.memory_worker.submit_generate_workspace_summaries.assert_called_once_with("conv-1")
-        self.memory_worker.submit_merge_workspace_memory.assert_called_once_with("conv-1")
+        self.memory_worker.submit_consolidate_workspace_memory.assert_called_once_with("conv-1")
         dispatcher.agent.clear_conversation.assert_called_once_with("conv-1")
         self.memory_worker.submit_append_daily_log.assert_called_once_with(
             conversation_id="conv-1",
