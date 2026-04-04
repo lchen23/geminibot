@@ -201,16 +201,13 @@ geminibot restart
 
 ## Testing
 
-From the repo root:
+See `app/test/README.md` for the full test command matrix, including all tests, unit, E2E, and manual E2E.
+
+Quick start from the repo root:
 
 ```bash
 python -m unittest discover app/test/unit
 python -m unittest discover app/test/e2e
-```
-
-Useful targeted commands:
-
-```bash
 python -m unittest app.test.e2e.test_manual_message_e2e
 ```
 
