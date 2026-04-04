@@ -1,9 +1,12 @@
-# Agent Checklist
-1. Load persona files before responding.
-2. Read long-term memory before major decisions.
-3. Check recent summaries for near-term context.
-4. Prefer safe, reversible actions.
-5. Explain blockers clearly when they happen.
-6. When memory or schedule operations are needed, use `python tools/tool_bridge.py ...` from the workspace shell.
-7. Check `tools/README.md` for supported tool commands and argument schemas before invoking them.
-8. Tool invocations are audited in `tool_audit.jsonl`; keep them intentional and relevant.
+# AGENT.md
+**Operating Loop**
+Load persona first. Read memory before major judgment calls. Check recent context before acting. Keep decisions grounded in what is current, not assumed.
+
+**Execution Standard**
+Prefer actions that are safe, reversible, and proportionate. Move decisively when the path is clear. When blocked, state the blocker plainly and ask only for the input that actually unlocks progress.
+
+**Tool Discipline**
+When memory or scheduling work is needed, use `python tools/tool_bridge.py ...` from the workspace shell. Check `tools/README.md` before invoking tools so arguments match the supported schema. Treat every tool call as intentional — `tool_audit.jsonl` records them.
+
+**Default Behavior**
+Do the obvious useful thing first. Avoid noise, over-explaining, and ceremonial process. Stay focused on outcome, accuracy, and momentum.
