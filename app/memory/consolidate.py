@@ -101,10 +101,19 @@ class ParsedSummary:
 class ConsolidationState:
     last_consolidated_log: str = ""
     log_hashes: dict[str, str] | None = None
+    merge_summary_hashes: dict[str, str] | None = None
+    merge_summary_files: dict[str, str] | None = None
+    summary_file_hashes: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.log_hashes is None:
             self.log_hashes = {}
+        if self.merge_summary_hashes is None:
+            self.merge_summary_hashes = {}
+        if self.merge_summary_files is None:
+            self.merge_summary_files = {}
+        if self.summary_file_hashes is None:
+            self.summary_file_hashes = {}
 
 
 @dataclass(slots=True)
@@ -113,6 +122,17 @@ class GeneratedSummaryUpdate:
     content_hash: str
     summary_block: str
     parsed: ParsedSummary | None
+
+
+@dataclass(slots=True)
+class IncrementalMergePlan:
+    delta_summaries: list[ParsedSummary]
+    changed_summary_dates: set[str]
+    rebuild_summaries: list[ParsedSummary]
+    summary_hashes: dict[str, str]
+    summary_files: dict[str, str]
+    summary_file_hashes: dict[str, str]
+    requires_rebuild: bool = False
 
 
 def consolidate_workspace_memory(workspace: Path, config: AppConfig | None = None) -> None:
@@ -157,8 +177,28 @@ def generate_workspace_summaries(workspace: Path, config: AppConfig | None = Non
 
 
 def merge_workspace_memory(workspace: Path, config: AppConfig | None = None) -> None:
-    summaries = _load_all_valid_summaries(workspace / "summaries")
-    _merge_parsed_summaries_into_memory(workspace, summaries, config=config)
+    state = _load_consolidation_state(workspace)
+    merge_plan = _plan_incremental_memory_merge(workspace, state)
+
+    if merge_plan.requires_rebuild:
+        _merge_parsed_summaries_into_memory(
+            workspace,
+            merge_plan.rebuild_summaries,
+            config=config,
+            replace_summary_sources=True,
+        )
+    elif merge_plan.delta_summaries:
+        _merge_parsed_summaries_into_memory(
+            workspace,
+            merge_plan.delta_summaries,
+            config=config,
+            replace_summary_sources_for_dates=merge_plan.changed_summary_dates,
+        )
+
+    state.merge_summary_hashes = merge_plan.summary_hashes
+    state.merge_summary_files = merge_plan.summary_files
+    state.summary_file_hashes = merge_plan.summary_file_hashes
+    _write_consolidation_state(workspace, state)
 
 
 def _generate_summary_updates(
@@ -258,13 +298,38 @@ def _merge_parsed_summaries_into_memory(
     summaries: list[ParsedSummary],
     *,
     config: AppConfig | None,
+    replace_summary_sources: bool = False,
+    replace_summary_sources_for_dates: set[str] | None = None,
 ) -> None:
     memory_file = workspace / "MEMORY.md"
     memory_sections = _read_memory_sections(memory_file)
     metadata_updates = {name: {} for name in MEMORY_SECTIONS}
+    existing_metadata = _load_memory_metadata(memory_file)
+
+    if replace_summary_sources or replace_summary_sources_for_dates:
+        target_sources = {
+            f"summary:{_normalize_item(log_date)}"
+            for log_date in (replace_summary_sources_for_dates or set())
+            if _normalize_item(log_date)
+        }
+        filtered_sections: dict[str, list[str]] = {}
+        for section_name in MEMORY_SECTIONS:
+            retained_entries = [
+                entry
+                for entry in existing_metadata.get(section_name, [])
+                if not (
+                    _normalize_item(entry.get("source", "")).startswith("summary:")
+                    if replace_summary_sources
+                    else _normalize_item(entry.get("source", "")) in target_sources
+                )
+            ]
+            existing_metadata[section_name] = retained_entries
+            filtered_sections[section_name] = [entry["content"] for entry in retained_entries]
+        memory_sections.update(filtered_sections)
+
     section_seen = {
-        name: {_normalize_item(item) for item in items}
-        for name, items in memory_sections.items()
+        name: {_normalize_item(item) for item in memory_sections.get(name, [])}
+        for name in MEMORY_SECTIONS
     }
 
     for summary in summaries:
@@ -298,8 +363,26 @@ def _merge_parsed_summaries_into_memory(
         memory_sections,
         config=config,
         workspace=workspace,
-        metadata_updates=metadata_updates,
+        metadata_updates=_merge_existing_metadata_updates(existing_metadata, metadata_updates),
     )
+
+
+def _merge_existing_metadata_updates(
+    existing_metadata: dict[str, list[dict[str, str]]],
+    metadata_updates: dict[str, dict[str, dict[str, str]]],
+) -> dict[str, dict[str, dict[str, str]]]:
+    merged_updates: dict[str, dict[str, dict[str, str]]] = {
+        section_name: dict(section_updates)
+        for section_name, section_updates in metadata_updates.items()
+    }
+    for section_name in MEMORY_SECTIONS:
+        section_updates = merged_updates.setdefault(section_name, {})
+        for entry in existing_metadata.get(section_name, []):
+            content = _normalize_item(entry.get("content", ""))
+            if not content or content in section_updates:
+                continue
+            section_updates[content] = dict(entry)
+    return merged_updates
 
 
 def _generate_semantic_summary(
@@ -830,6 +913,57 @@ def _load_all_valid_summaries(summaries_dir: Path) -> list[ParsedSummary]:
     return summaries
 
 
+def _plan_incremental_memory_merge(workspace: Path, state: ConsolidationState) -> IncrementalMergePlan:
+    summaries_dir = workspace / "summaries"
+    current_summaries: list[ParsedSummary] = []
+    current_hashes: dict[str, str] = {}
+    current_files: dict[str, str] = {}
+    current_file_hashes: dict[str, str] = {}
+
+    if summaries_dir.exists():
+        for summary_file in sorted(summaries_dir.glob("*.md")):
+            file_hash = _content_hash(summary_file.read_text(encoding="utf-8"))
+            relative_name = summary_file.relative_to(workspace).as_posix()
+            current_file_hashes[relative_name] = file_hash
+            for log_date, block in _load_existing_summary_blocks(summary_file).items():
+                parsed = _parse_summary(log_date, block)
+                if parsed is None:
+                    continue
+                current_summaries.append(parsed)
+                current_hashes[log_date] = _content_hash(parsed.to_markdown())
+                current_files[log_date] = relative_name
+
+    previous_hashes = state.merge_summary_hashes or {}
+    previous_files = state.merge_summary_files or {}
+    previous_file_hashes = state.summary_file_hashes or {}
+    changed_dates = {
+        log_date
+        for log_date, content_hash in current_hashes.items()
+        if previous_hashes.get(log_date) != content_hash or previous_files.get(log_date) != current_files.get(log_date)
+    }
+    removed_dates = set(previous_hashes) - set(current_hashes)
+    changed_files = {
+        relative_name
+        for relative_name, file_hash in current_file_hashes.items()
+        if previous_file_hashes.get(relative_name) != file_hash
+    }
+    removed_files = set(previous_file_hashes) - set(current_file_hashes)
+    requires_rebuild = bool(removed_dates or removed_files)
+
+    summaries_by_date = {summary.log_date: summary for summary in current_summaries}
+    delta_summaries = [summaries_by_date[log_date] for log_date in sorted(changed_dates) if log_date in summaries_by_date]
+    rebuild_summaries = current_summaries if requires_rebuild else []
+    return IncrementalMergePlan(
+        delta_summaries=delta_summaries,
+        changed_summary_dates=set(changed_dates),
+        rebuild_summaries=rebuild_summaries,
+        summary_hashes=current_hashes,
+        summary_files=current_files,
+        summary_file_hashes=current_file_hashes,
+        requires_rebuild=requires_rebuild,
+    )
+
+
 def _load_existing_valid_summaries(summary_file: Path) -> dict[str, ParsedSummary]:
     if not summary_file.exists():
         return {}
@@ -923,21 +1057,52 @@ def _load_consolidation_state(workspace: Path) -> ConsolidationState:
             normalized_hash = _normalize_item(str(content_hash))
             if normalized_log_date and normalized_hash:
                 log_hashes[normalized_log_date] = normalized_hash
+
+    def _load_string_map(key: str) -> dict[str, str]:
+        raw = payload.get(key, {})
+        loaded: dict[str, str] = {}
+        if not isinstance(raw, dict):
+            return loaded
+        for map_key, map_value in raw.items():
+            normalized_key = _normalize_item(str(map_key))
+            normalized_value = _normalize_item(str(map_value))
+            if normalized_key and normalized_value:
+                loaded[normalized_key] = normalized_value
+        return loaded
+
     return ConsolidationState(
         last_consolidated_log=last_consolidated_log,
         log_hashes=log_hashes,
+        merge_summary_hashes=_load_string_map("merge_summary_hashes"),
+        merge_summary_files=_load_string_map("merge_summary_files"),
+        summary_file_hashes=_load_string_map("summary_file_hashes"),
     )
 
 
 def _write_consolidation_state(workspace: Path, state: ConsolidationState) -> None:
     state_file = _consolidation_state_file(workspace)
     payload = {
-        "version": 1,
+        "version": 2,
         "last_consolidated_log": state.last_consolidated_log,
         "log_hashes": {
             log_date: content_hash
             for log_date, content_hash in sorted((state.log_hashes or {}).items())
             if log_date and content_hash
+        },
+        "merge_summary_hashes": {
+            log_date: content_hash
+            for log_date, content_hash in sorted((state.merge_summary_hashes or {}).items())
+            if log_date and content_hash
+        },
+        "merge_summary_files": {
+            log_date: relative_name
+            for log_date, relative_name in sorted((state.merge_summary_files or {}).items())
+            if log_date and relative_name
+        },
+        "summary_file_hashes": {
+            relative_name: content_hash
+            for relative_name, content_hash in sorted((state.summary_file_hashes or {}).items())
+            if relative_name and content_hash
         },
     }
     state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

@@ -142,6 +142,7 @@ class MemoryWorker:
             try:
                 if task is None:
                     return
+                stop_requested = False
                 if task.description == "save_memory_note" and task.note_content is not None:
                     batch = [task.note_content]
                     while True:
@@ -150,9 +151,9 @@ class MemoryWorker:
                         except Empty:
                             break
                         if queued_task is None:
-                            queue.put((TASK_PRIORITY_MERGE_MEMORY + 1, next(self._sequence), None))
+                            stop_requested = True
                             queue.task_done()
-                            continue
+                            break
                         if queued_task.description == "save_memory_note" and queued_task.note_content is not None:
                             batch.append(queued_task.note_content)
                             queue.task_done()
@@ -165,6 +166,8 @@ class MemoryWorker:
                     task.run()
                 if task.refresh_snapshot:
                     self.store.refresh_snapshot(task.conversation_id)
+                if stop_requested:
+                    return
             except Exception:  # pragma: no cover - defensive logging
                 logger.exception(
                     "Memory task failed: %s for conversation %s",

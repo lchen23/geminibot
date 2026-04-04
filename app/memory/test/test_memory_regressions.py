@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from app.config import AppConfig
 from app.memory.consolidate import (
+    NoteClassification,
     SummaryGenerationResult,
     _apply_retention_policy,
     _apply_summary_updates,
@@ -503,6 +504,101 @@ class MemoryRegressionTests(unittest.TestCase):
         merge_workspace_memory(self.workspace, config=self.config)
         memory_text = (self.workspace / "MEMORY.md").read_text(encoding="utf-8")
         self.assertIn("Prefer concise release notes.", memory_text)
+
+    def test_merge_workspace_memory_skips_unchanged_summaries(self) -> None:
+        summaries_dir = self.workspace / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        (summaries_dir / "2026-04-03.md").write_text(
+            "## 2026-04-03\n"
+            "### Semantic Summary\n"
+            "- Stable summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- Prefer concise release notes.\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "app.memory.consolidate._classify_note_semantics",
+            return_value=NoteClassification(
+                section="User Preferences",
+                kind="preference",
+                confidence=0.9,
+                ttl_days=None,
+            ),
+        ) as classify:
+            merge_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(classify.call_count, 1)
+            merge_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(classify.call_count, 1)
+
+        state = _load_consolidation_state(self.workspace)
+        self.assertIn("2026-04-03", state.merge_summary_hashes)
+        self.assertIn("2026-04-03", state.merge_summary_files)
+
+    def test_merge_workspace_memory_replaces_changed_summary_notes_for_same_date(self) -> None:
+        summaries_dir = self.workspace / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        summary_file = summaries_dir / "2026-04-03.md"
+        summary_file.write_text(
+            "## 2026-04-03\n"
+            "### Semantic Summary\n"
+            "- First summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- Prefer concise release notes.\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "app.memory.consolidate._classify_note_semantics",
+            side_effect=[
+                NoteClassification("User Preferences", "preference", 0.9, None),
+                NoteClassification("User Preferences", "preference", 0.9, None),
+            ],
+        ):
+            merge_workspace_memory(self.workspace, config=self.config)
+            summary_file.write_text(
+                "## 2026-04-03\n"
+                "### Semantic Summary\n"
+                "- Updated summary.\n"
+                "### Potential Long-Term Notes\n"
+                "- Prefer terse release notes.\n",
+                encoding="utf-8",
+            )
+            merge_workspace_memory(self.workspace, config=self.config)
+
+        memory_text = (self.workspace / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertNotIn("Prefer concise release notes.", memory_text)
+        self.assertIn("Prefer terse release notes.", memory_text)
+
+    def test_merge_workspace_memory_rebuilds_when_summary_file_is_removed(self) -> None:
+        summaries_dir = self.workspace / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        summary_file = summaries_dir / "2026-04-03.md"
+        summary_file.write_text(
+            "## 2026-04-03\n"
+            "### Semantic Summary\n"
+            "- First summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- Prefer concise release notes.\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "app.memory.consolidate._classify_note_semantics",
+            return_value=NoteClassification(
+                section="User Preferences",
+                kind="preference",
+                confidence=0.9,
+                ttl_days=None,
+            ),
+        ):
+            merge_workspace_memory(self.workspace, config=self.config)
+
+        summary_file.unlink()
+        merge_workspace_memory(self.workspace, config=self.config)
+
+        memory_text = (self.workspace / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertNotIn("Prefer concise release notes.", memory_text)
 
     def test_read_recent_summaries_reuses_cache_until_worker_refresh(self) -> None:
         summaries_dir = self.workspace / "summaries"
