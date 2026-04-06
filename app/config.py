@@ -41,24 +41,12 @@ class AppConfig:
         self.workspace_root = self.app_root / "workspaces"
         self.data_root = self.app_root / "data"
 
-    @staticmethod
-    def _default_app_root(repo_root: Path) -> Path:
-        legacy_workspace_root = os.getenv("WORKSPACE_ROOT")
-        if legacy_workspace_root:
-            return Path(legacy_workspace_root).expanduser().parent
-
-        legacy_data_root = os.getenv("DATA_ROOT")
-        if legacy_data_root:
-            return Path(legacy_data_root).expanduser().parent
-
-        return repo_root
-
     @classmethod
     def load(cls) -> "AppConfig":
         repo_root = Path(__file__).resolve().parent.parent
         load_dotenv(repo_root / ".env")
 
-        app_root = Path(os.getenv("APP_ROOT", str(cls._default_app_root(repo_root)))).expanduser()
+        app_root = Path(os.getenv("APP_ROOT", str(repo_root))).expanduser()
 
         config = cls(
             feishu_app_id=os.getenv("FEISHU_APP_ID", ""),
