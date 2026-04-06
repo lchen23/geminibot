@@ -84,8 +84,7 @@ class MemorySemanticsTests(unittest.TestCase):
 class MemorySearchRankingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        workspace_root = Path(self.temp_dir.name) / "workspaces"
-        data_root = Path(self.temp_dir.name) / "data"
+        root = Path(self.temp_dir.name)
         self.config = AppConfig(
             feishu_app_id="",
             feishu_app_secret="",
@@ -95,8 +94,7 @@ class MemorySearchRankingTests(unittest.TestCase):
             claude_cli_path="claude",
             bot_name="GeminiBot",
             default_timezone="UTC",
-            workspace_root=workspace_root,
-            data_root=data_root,
+            app_root=root,
             poll_interval_seconds=30,
             recent_summary_days=7,
             card_footer_enabled=True,

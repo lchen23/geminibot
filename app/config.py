@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     from dotenv import load_dotenv
 except ModuleNotFoundError:  # pragma: no cover - optional runtime fallback
-    def load_dotenv() -> bool:
+    def load_dotenv(dotenv_path: str | Path | None = None) -> bool:
         return False
 
 
@@ -28,19 +28,37 @@ class AppConfig:
     claude_cli_path: str
     bot_name: str
     default_timezone: str
-    workspace_root: Path
-    data_root: Path
-    poll_interval_seconds: int
-    recent_summary_days: int
-    card_footer_enabled: bool
-    log_level: str
+    app_root: Path
+    workspace_root: Path = field(init=False)
+    data_root: Path = field(init=False)
+    poll_interval_seconds: int = 30
+    recent_summary_days: int = 7
+    card_footer_enabled: bool = True
+    log_level: str = "INFO"
+
+    def __post_init__(self) -> None:
+        self.app_root = self.app_root.expanduser()
+        self.workspace_root = self.app_root / "workspaces"
+        self.data_root = self.app_root / "data"
+
+    @staticmethod
+    def _default_app_root(repo_root: Path) -> Path:
+        legacy_workspace_root = os.getenv("WORKSPACE_ROOT")
+        if legacy_workspace_root:
+            return Path(legacy_workspace_root).expanduser().parent
+
+        legacy_data_root = os.getenv("DATA_ROOT")
+        if legacy_data_root:
+            return Path(legacy_data_root).expanduser().parent
+
+        return repo_root
 
     @classmethod
     def load(cls) -> "AppConfig":
-        load_dotenv()
+        repo_root = Path(__file__).resolve().parent.parent
+        load_dotenv(repo_root / ".env")
 
-        workspace_root = Path(os.getenv("WORKSPACE_ROOT", str(Path.home() / "geminibot" / "workspaces"))).expanduser()
-        data_root = Path(os.getenv("DATA_ROOT", str(Path.home() / "geminibot" / "data"))).expanduser()
+        app_root = Path(os.getenv("APP_ROOT", str(cls._default_app_root(repo_root)))).expanduser()
 
         config = cls(
             feishu_app_id=os.getenv("FEISHU_APP_ID", ""),
@@ -51,8 +69,7 @@ class AppConfig:
             claude_cli_path=os.getenv("CLAUDE_CLI_PATH", "claude"),
             bot_name=os.getenv("BOT_NAME", "GeminiBot"),
             default_timezone=os.getenv("DEFAULT_TIMEZONE", "Asia/Shanghai"),
-            workspace_root=workspace_root,
-            data_root=data_root,
+            app_root=app_root,
             poll_interval_seconds=int(os.getenv("POLL_INTERVAL_SECONDS", "30")),
             recent_summary_days=int(os.getenv("RECENT_SUMMARY_DAYS", "7")),
             card_footer_enabled=os.getenv("CARD_FOOTER_ENABLED", "true").lower() == "true",

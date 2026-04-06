@@ -87,18 +87,11 @@ class ManualMessageE2ETests(unittest.TestCase):
         if missing:
             raise unittest.SkipTest(f"Missing manual E2E settings: {', '.join(missing)}")
 
-        workspace_root = Path(
+        app_root = Path(
             _setting(
-                "WORKSPACE_ROOT",
+                "APP_ROOT",
                 repo_env,
-                str(Path.home() / "geminibot" / "workspaces"),
-            )
-        ).expanduser()
-        data_root = Path(
-            _setting(
-                "DATA_ROOT",
-                repo_env,
-                str(Path.home() / "geminibot" / "data"),
+                str(repo_root),
             )
         ).expanduser()
 
@@ -111,8 +104,7 @@ class ManualMessageE2ETests(unittest.TestCase):
             claude_cli_path=_setting("CLAUDE_CLI_PATH", repo_env, "claude"),
             bot_name=_setting("BOT_NAME", repo_env, "GeminiBot"),
             default_timezone=_setting("DEFAULT_TIMEZONE", repo_env, "Asia/Shanghai"),
-            workspace_root=workspace_root,
-            data_root=data_root,
+            app_root=app_root,
             poll_interval_seconds=int(_setting("POLL_INTERVAL_SECONDS", repo_env, "30")),
             recent_summary_days=int(_setting("RECENT_SUMMARY_DAYS", repo_env, "7")),
             card_footer_enabled=_setting("CARD_FOOTER_ENABLED", repo_env, "true").lower() == "true",

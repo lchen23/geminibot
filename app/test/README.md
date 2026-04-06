@@ -57,8 +57,7 @@ Optional but useful:
 
 ```env
 GEMINIBOT_E2E_FEISHU_USER_ID=<user id for seeded tasks>
-WORKSPACE_ROOT=~/geminibot/workspaces
-DATA_ROOT=~/geminibot/data
+APP_ROOT=~/geminibot
 ```
 
 The suite also reads normal app settings such as `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, `AI_PROVIDER`, `GEMINI_CLI_PATH`, and `CLAUDE_CLI_PATH` through the existing app config.

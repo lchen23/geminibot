@@ -91,8 +91,7 @@ Useful optional settings:
 ```env
 BOT_NAME=GeminiBot
 DEFAULT_TIMEZONE=America/Los_Angeles
-WORKSPACE_ROOT=~/geminibot/workspaces
-DATA_ROOT=~/geminibot/data
+APP_ROOT=~/geminibot
 POLL_INTERVAL_SECONDS=30
 LOG_LEVEL=INFO
 ```

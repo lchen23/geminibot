@@ -213,7 +213,7 @@ TOOL_BRIDGE_README = dedent(
 class WorkspaceManager:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
-        self.project_root = config.workspace_root.parent
+        self.project_root = config.app_root
         self.templates_root = self.project_root / "templates"
 
     def ensure_workspace(self, conversation_id: str) -> Path:
