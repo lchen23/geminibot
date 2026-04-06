@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-geminibot-tool-bridge-acceptance = "run_tool_bridge_acceptance:main"
+geminibot = "app.cli:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -20,4 +20,3 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["app"]
-py-modules = ["run_tool_bridge_acceptance"]

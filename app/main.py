@@ -1,17 +1,26 @@
+import logging
 import time
 
 from app.config import AppConfig
 from app.dispatcher import Dispatcher
 from app.gateway.feishu import FeishuGateway
+from app.memory.worker import MemoryWorker
 from app.scheduler.loop import SchedulerLoop
 from app.utils.logging import configure_logging
 
+logger = logging.getLogger(__name__)
 
-def main() -> None:
+
+def run_service() -> None:
     config = AppConfig.load()
     configure_logging(config.log_level)
+    startup = config.run_startup_checks()
+    for warning in startup.warnings:
+        logger.warning("Startup check warning: %s", warning)
 
-    dispatcher = Dispatcher(config=config)
+    memory_worker = MemoryWorker(config)
+    memory_worker.start()
+    dispatcher = Dispatcher(config=config, memory_worker=memory_worker)
     gateway = FeishuGateway(config=config, dispatcher=dispatcher)
     scheduler = SchedulerLoop(config=config, dispatcher=dispatcher, deliver_message=gateway.deliver)
 
@@ -22,7 +31,15 @@ def main() -> None:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
-        pass
+        logger.info("Shutdown signal received.")
+    finally:
+        gateway.stop()
+        scheduler.stop()
+        memory_worker.stop()
+
+
+def main() -> None:
+    run_service()
 
 
 if __name__ == "__main__":

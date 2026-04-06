@@ -7,16 +7,39 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 from urllib import error, request
+from uuid import uuid4
 
 try:
-    from lark_oapi import EventDispatcherHandler, LogLevel, ws
+    from lark_oapi import Client, EventDispatcherHandler, LogLevel, ws
+    from lark_oapi.api.cardkit.v1 import (
+        ContentCardElementRequest,
+        ContentCardElementRequestBody,
+        CreateCardRequest,
+        CreateCardRequestBody,
+    )
+    from lark_oapi.api.im.v1 import (
+        CreateMessageRequest,
+        CreateMessageRequestBody,
+        ReplyMessageRequest,
+        ReplyMessageRequestBody,
+    )
 except ModuleNotFoundError:  # pragma: no cover - optional runtime fallback
+    Client = None
     EventDispatcherHandler = None
     ws = None
     LogLevel = None
+    CreateCardRequest = None
+    CreateCardRequestBody = None
+    ContentCardElementRequest = None
+    ContentCardElementRequestBody = None
+    CreateMessageRequest = None
+    CreateMessageRequestBody = None
+    ReplyMessageRequest = None
+    ReplyMessageRequestBody = None
 
 from app.config import AppConfig
 from app.dispatcher import Dispatcher, IncomingMessage
+from app.rendering.cards import build_streaming_markdown_card
 from app.utils.state import JsonListState
 
 logger = logging.getLogger(__name__)
@@ -32,15 +55,35 @@ class FeishuGateway:
         self._tenant_token_expires_at = 0.0
         self._ws_client: Any | None = None
         self._ws_thread: threading.Thread | None = None
+        self._client: Any | None = None
+        self._stop_event = threading.Event()
 
     def start(self) -> None:
+        self._stop_event.clear()
         if not self._has_credentials():
             logger.info("FeishuGateway started in local mode. Use handle_text_message() or CLI simulation to feed messages.")
             return
 
         self._get_tenant_access_token(force_refresh=True)
+        if Client is not None:
+            self._client = Client.builder().app_id(self.config.feishu_app_id).app_secret(self.config.feishu_app_secret).build()
         self._start_websocket_client()
         logger.info("FeishuGateway initialized Feishu client for app_id=%s", self.config.feishu_app_id)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._ws_client is not None:
+            stop = getattr(self._ws_client, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    logger.exception("Failed to stop Feishu WebSocket client cleanly.")
+        if self._ws_thread is not None and self._ws_thread.is_alive():
+            self._ws_thread.join(timeout=5)
+        self._ws_client = None
+        self._ws_thread = None
+        logger.info("FeishuGateway stopped.")
 
     def handle_text_message(
         self,
@@ -66,14 +109,18 @@ class FeishuGateway:
             conversation_id=conversation_id,
             text=text,
             sent_at=datetime.now(timezone.utc).isoformat(),
+            chat_type="p2p" if chat_id == conversation_id else "group",
         )
-        stream_state = self._build_stream_state(chat_id) if self._has_credentials() else None
-        stream_callback = stream_state["callback"] if stream_state else None
-        response, _events = self.dispatcher.handle_stream(request_message, on_event=stream_callback)
-        if stream_state and stream_state["message_id"]:
-            self._update_card_message(stream_state["message_id"], response)
-            logger.info("Prepared streamed response for chat_id=%s message_id=%s", chat_id, stream_state["message_id"])
-            return None
+
+        if self._has_credentials() and self._supports_streaming_cards() and self._client is not None:
+            try:
+                self._stream_reply_to_card(request_message)
+                logger.info("Prepared streaming response for chat_id=%s", chat_id)
+                return None
+            except Exception:
+                logger.exception("Streaming path failed for chat_id=%s; falling back to normal reply", chat_id)
+
+        response = self.dispatcher.handle(request_message)
         logger.info("Prepared response for chat_id=%s", chat_id)
         return response
 
@@ -117,7 +164,7 @@ class FeishuGateway:
         self._tenant_token_expires_at = now + int(payload.get("expire", 7200))
         return token
 
-    def _send_card_message(self, chat_id: str, payload: dict) -> dict:
+    def _send_card_message(self, chat_id: str, payload: dict) -> None:
         token = self._get_tenant_access_token()
         response_payload = self._post_json(
             url="https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
@@ -130,81 +177,136 @@ class FeishuGateway:
         )
         if response_payload.get("code") != 0:
             raise RuntimeError(f"Feishu send failed: {response_payload.get('msg', 'unknown error')}")
-        return response_payload
 
-    def _update_card_message(self, message_id: str, payload: dict) -> None:
-        token = self._get_tenant_access_token()
-        response_payload = self._patch_json(
-            url=f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}",
-            body={
-                "content": json.dumps(payload, ensure_ascii=False),
-            },
-            headers={"Authorization": f"Bearer {token}"},
+    def _supports_streaming_cards(self) -> bool:
+        return all(
+            dependency is not None
+            for dependency in (
+                self._client,
+                CreateCardRequest,
+                CreateCardRequestBody,
+                ContentCardElementRequest,
+                ContentCardElementRequestBody,
+                CreateMessageRequest,
+                CreateMessageRequestBody,
+                ReplyMessageRequest,
+                ReplyMessageRequestBody,
+            )
         )
-        if response_payload.get("code") != 0:
-            raise RuntimeError(f"Feishu update failed: {response_payload.get('msg', 'unknown error')}")
 
-    def _build_stream_state(self, chat_id: str) -> dict:
-        initial_payload = self._build_stream_payload("Generating…")
-        response_payload = self._send_card_message(chat_id, initial_payload)
-        message_id = (((response_payload.get("data") or {}).get("message") or {}).get("message_id"))
-        sent_text = ""
+    def _stream_reply_to_card(self, message: IncomingMessage) -> dict:
+        element_id = self._build_stream_element_id()
+        card_id = self._create_streaming_card(element_id)
+        self._send_streaming_card_reference(message=message, card_id=card_id)
 
-        def callback(event: dict) -> None:
-            nonlocal sent_text
-            if not message_id:
-                return
-            updated_text = self._apply_stream_event(sent_text, event)
-            if updated_text is None or updated_text == sent_text:
-                return
-            sent_text = updated_text
-            self._update_card_message(message_id, self._build_stream_payload(sent_text))
+        sequence = 0
+        latest_text = ""
+        try:
+            for latest_text in self.dispatcher.stream_handle(message):
+                sequence += 1
+                self._update_streaming_card(card_id=card_id, element_id=element_id, content=latest_text, sequence=sequence)
+        except Exception:
+            logger.exception("Streaming reply failed for chat_id=%s", message.chat_id)
+            if not latest_text:
+                latest_text = "Streaming reply failed."
+            try:
+                sequence += 1
+                self._update_streaming_card(card_id=card_id, element_id=element_id, content=latest_text, sequence=sequence)
+            except Exception:
+                logger.exception("Failed to update streaming card after error for chat_id=%s", message.chat_id)
+        return {"type": "streaming_card", "card_id": card_id, "text": latest_text}
 
-        return {
-            "message_id": message_id,
-            "callback": callback,
-        }
+    def _build_stream_element_id(self) -> str:
+        return f"s{uuid4().hex[:12]}"
 
-    def _build_stream_payload(self, text: str) -> dict:
-        return {
-            "schema": "2.0",
-            "body": {
-                "elements": [
-                    {"tag": "markdown", "content": text or "…"},
-                ]
-            },
-        }
+    def _create_streaming_card(self, element_id: str) -> str:
+        if self._client is None:
+            raise RuntimeError("Feishu streaming card client is not initialized")
+        request = (
+            CreateCardRequest.builder()
+            .request_body(
+                CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(
+                    json.dumps(
+                        build_streaming_markdown_card(
+                            "Thinking...",
+                            summary="Thinking...",
+                            element_id=element_id,
+                        ),
+                        ensure_ascii=False,
+                    )
+                )
+                .build()
+            )
+            .build()
+        )
+        response = self._client.cardkit.v1.card.create(request)
+        if not response.success():
+            raise RuntimeError(
+                f"Feishu create card failed: code={response.code}, msg={response.msg}, log_id={response.get_log_id()}"
+            )
+        card_id = getattr(response.data, "card_id", None)
+        if not card_id:
+            raise RuntimeError("Feishu create card failed: card_id missing in response")
+        return card_id
 
-    def _apply_stream_event(self, current_text: str, event: dict) -> str | None:
-        message = event.get("message")
-        if isinstance(message, dict):
-            message_text = self._extract_message_text(message)
-            if message_text is not None:
-                return message_text
+    def _send_streaming_card_reference(self, *, message: IncomingMessage, card_id: str) -> None:
+        if self._client is None:
+            raise RuntimeError("Feishu streaming card client is not initialized")
+        content = json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False)
+        if message.chat_type == "group":
+            request = (
+                ReplyMessageRequest.builder()
+                .message_id(message.message_id)
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type("interactive")
+                    .content(content)
+                    .build()
+                )
+                .build()
+            )
+            response = self._client.im.v1.message.reply(request)
+        else:
+            request = (
+                CreateMessageRequest.builder()
+                .receive_id_type("chat_id")
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(message.chat_id)
+                    .msg_type("interactive")
+                    .content(content)
+                    .build()
+                )
+                .build()
+            )
+            response = self._client.im.v1.chat.create(request)
+        if not response.success():
+            raise RuntimeError(
+                f"Feishu send streaming card failed: code={response.code}, msg={response.msg}, log_id={response.get_log_id()}"
+            )
 
-        event_type = event.get("type")
-        if event_type == "content_block_delta":
-            delta = event.get("delta")
-            if isinstance(delta, dict) and delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
-                return current_text + delta["text"]
-        if event_type == "content_block_start":
-            content_block = event.get("content_block")
-            if isinstance(content_block, dict) and content_block.get("type") == "text" and isinstance(content_block.get("text"), str):
-                return current_text + content_block["text"]
-        return None
-
-    def _extract_message_text(self, message: dict) -> str | None:
-        content = message.get("content")
-        if not isinstance(content, list):
-            return None
-
-        text_parts: list[str] = []
-        for block in content:
-            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                text_parts.append(block["text"])
-        if not text_parts:
-            return None
-        return "".join(text_parts)
+    def _update_streaming_card(self, *, card_id: str, element_id: str, content: str, sequence: int) -> None:
+        if self._client is None:
+            raise RuntimeError("Feishu streaming card client is not initialized")
+        request = (
+            ContentCardElementRequest.builder()
+            .card_id(card_id)
+            .element_id(element_id)
+            .request_body(
+                ContentCardElementRequestBody.builder()
+                .content(content)
+                .sequence(sequence)
+                .build()
+            )
+            .build()
+        )
+        response = self._client.cardkit.v1.card_element.content(request)
+        if not response.success():
+            raise RuntimeError(
+                f"Feishu update card failed: code={response.code}, msg={response.msg}, log_id={response.get_log_id()}"
+            )
 
     def _start_websocket_client(self) -> None:
         if self._ws_thread and self._ws_thread.is_alive():
@@ -230,7 +332,8 @@ class FeishuGateway:
         try:
             self._ws_client.start()
         except Exception:  # pragma: no cover - depends on external SDK/runtime
-            logger.exception("Feishu WebSocket client stopped unexpectedly.")
+            if not self._stop_event.is_set():
+                logger.exception("Feishu WebSocket client stopped unexpectedly.")
 
     def _build_event_handler(self) -> Any:
         handler = EventDispatcherHandler.builder("", "")
@@ -288,12 +391,6 @@ class FeishuGateway:
         return ""
 
     def _post_json(self, *, url: str, body: dict, headers: dict[str, str] | None = None) -> dict:
-        return self._request_json(url=url, body=body, headers=headers, method="POST")
-
-    def _patch_json(self, *, url: str, body: dict, headers: dict[str, str] | None = None) -> dict:
-        return self._request_json(url=url, body=body, headers=headers, method="PATCH")
-
-    def _request_json(self, *, url: str, body: dict, headers: dict[str, str] | None = None, method: str) -> dict:
         request_headers = {
             "Content-Type": "application/json; charset=utf-8",
         }
@@ -304,7 +401,7 @@ class FeishuGateway:
             url,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             headers=request_headers,
-            method=method,
+            method="POST",
         )
         try:
             with request.urlopen(http_request, timeout=10) as response:

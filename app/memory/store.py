@@ -1,12 +1,90 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
+from threading import Lock
+from typing import ClassVar
 
 from app.config import AppConfig
+from app.memory.consolidate import (
+    _build_note_metadata,
+    _classify_long_term_note,
+    _load_memory_metadata,
+    _parse_timestamp,
+    _rewrite_memory_sections,
+)
+
+REQUIRED_MEMORY_SECTIONS = (
+    "User Preferences",
+    "Stable Facts",
+    "Saved Notes",
+)
+
+SECTION_ALIASES = {
+    "Project Facts": "Stable Facts",
+}
+
+DEFAULT_MEMORY_ITEMS = {
+    "User Preferences": ["Prefer concise and practical responses."],
+    "Stable Facts": ["GeminiBot uses Gemini CLI Agent as the core reasoning runtime."],
+    "Saved Notes": [],
+}
+LAYER_MEMORY = "memory"
+LAYER_SUMMARY = "summary"
+LAYER_LOG = "log"
+HIGH_PRIORITY_SUMMARY_HEADINGS = {"### Semantic Summary", "### Potential Long-Term Notes"}
+SECTION_RELEVANCE_BOOSTS = {
+    "User Preferences": 90,
+    "Stable Facts": 85,
+    "Saved Notes": 80,
+}
+SUMMARY_RELEVANCE_BOOST = 75
+LOG_RELEVANCE_BOOST = 10
+MAX_LOG_RESULTS_WHEN_HIGHER_LAYERS_HIT = 2
+KIND_RELEVANCE_BOOSTS = {
+    "preference": 35,
+    "fact": 30,
+    "note": 10,
+    "context": 5,
+    "low_confidence": -25,
+}
+SOURCE_RELEVANCE_BOOSTS = {
+    "remember": 20,
+    "rewrite": 10,
+}
+RECENCY_MAX_DAYS = 30
+RECENCY_MAX_BOOST = 20
+CONFIDENCE_MAX_BOOST = 20
+TTL_MAX_BOOST = 15
+TTL_EXPIRED_PENALTY = -40
+
+
+@dataclass(slots=True)
+class SearchHit:
+    text: str
+    score: int
+    layer: str
+
+
+@dataclass(slots=True)
+class RecentSummariesSnapshot:
+    text: str
+
+
+@dataclass(slots=True)
+class MemorySnapshot:
+    memory_text: str
+    recent_summaries_text: str
+    signature: tuple[tuple[str, int], ...]
 
 
 class MemoryStore:
+    _snapshot_cache: ClassVar[dict[tuple[str, int], MemorySnapshot]] = {}
+    _snapshot_lock: ClassVar[Lock] = Lock()
+    _recent_summaries_cache: ClassVar[dict[tuple[str, int], RecentSummariesSnapshot]] = {}
+    _recent_summaries_lock: ClassVar[Lock] = Lock()
+
     def __init__(self, config: AppConfig) -> None:
         self.config = config
 
@@ -24,29 +102,84 @@ class MemoryStore:
             handle.write(entry)
 
     def save_memory_note(self, conversation_id: str, content: str) -> None:
-        memory_file = self.get_workspace(conversation_id) / "MEMORY.md"
-        previous = self.read_memory(conversation_id)
-        if content not in previous:
-            memory_file.write_text(previous.rstrip() + f"\n- {content}\n", encoding="utf-8")
+        self.save_memory_notes(conversation_id, [content])
+
+    def save_memory_notes(self, conversation_id: str, contents: list[str]) -> None:
+        sections = self._read_memory_sections(conversation_id)
+        workspace = self.get_workspace(conversation_id)
+        seen_by_section = {
+            name: {self._normalize_item(item) for item in sections.get(name, [])}
+            for name in REQUIRED_MEMORY_SECTIONS
+        }
+        metadata_updates = {
+            name: {} for name in REQUIRED_MEMORY_SECTIONS
+        }
+        changed = False
+
+        for content in contents:
+            cleaned = self._normalize_item(content)
+            if not cleaned:
+                continue
+            classification = _classify_long_term_note(
+                cleaned,
+                source="remember",
+                config=self.config,
+                workspace=workspace,
+            )
+            target_section = classification.section
+            if cleaned in seen_by_section[target_section]:
+                continue
+            seen_by_section[target_section].add(cleaned)
+            sections[target_section].append(cleaned)
+            metadata_updates[target_section][cleaned] = _build_note_metadata(
+                cleaned,
+                classification=classification,
+                source="remember",
+            )
+            changed = True
+
+        if changed:
+            self._write_memory_sections(conversation_id, sections, metadata_updates=metadata_updates)
 
     def read_memory(self, conversation_id: str) -> str:
         memory_file = self.get_workspace(conversation_id) / "MEMORY.md"
         if memory_file.exists():
             return memory_file.read_text(encoding="utf-8")
-        return "# Memory\n"
+        return self._serialize_memory_sections(self._default_memory_sections())
 
     def rewrite_memory(self, conversation_id: str, lines: list[str]) -> None:
-        memory_file = self.get_workspace(conversation_id) / "MEMORY.md"
-        deduped = []
-        seen: set[str] = set()
+        sections = self._read_memory_sections(conversation_id)
+        sections["Saved Notes"] = []
+        seen_by_section = {
+            name: {self._normalize_item(item) for item in sections.get(name, [])}
+            for name in REQUIRED_MEMORY_SECTIONS
+        }
+        metadata_updates = {
+            name: {} for name in REQUIRED_MEMORY_SECTIONS
+        }
+        workspace = self.get_workspace(conversation_id)
+
         for line in lines:
-            cleaned = line.strip()
-            if not cleaned or cleaned in seen:
+            cleaned = self._normalize_item(line)
+            if not cleaned:
                 continue
-            seen.add(cleaned)
-            deduped.append(cleaned)
-        body = "\n".join(f"- {line}" for line in deduped)
-        memory_file.write_text(f"# Memory\n\n{body}\n" if body else "# Memory\n", encoding="utf-8")
+            classification = _classify_long_term_note(
+                cleaned,
+                source="rewrite",
+                config=self.config,
+                workspace=workspace,
+            )
+            target_section = classification.section
+            if cleaned in seen_by_section[target_section]:
+                continue
+            seen_by_section[target_section].add(cleaned)
+            sections[target_section].append(cleaned)
+            metadata_updates[target_section][cleaned] = _build_note_metadata(
+                cleaned,
+                classification=classification,
+                source="rewrite",
+            )
+        self._write_memory_sections(conversation_id, sections, metadata_updates=metadata_updates)
 
     def write_summary(self, conversation_id: str, summary_date: date, content: str) -> Path:
         workspace = self.get_workspace(conversation_id)
@@ -57,23 +190,109 @@ class MemoryStore:
         return summary_file
 
     def read_recent_summaries(self, workspace: Path, days: int) -> str:
-        summaries_dir = workspace / "summaries"
-        if not summaries_dir.exists():
-            return ""
-        files = sorted(summaries_dir.glob("*.md"), reverse=True)[:days]
-        return "\n\n".join(path.read_text(encoding="utf-8").strip() for path in files if path.exists())
+        cache_key = (self._workspace_cache_key(workspace), days)
+        with self._recent_summaries_lock:
+            cached = self._recent_summaries_cache.get(cache_key)
+            if cached is not None:
+                return cached.text
+
+        text = self._read_recent_summaries_from_disk(workspace, days)
+        with self._recent_summaries_lock:
+            self._recent_summaries_cache[cache_key] = RecentSummariesSnapshot(text=text)
+        return text
+
+    def read_snapshot(self, conversation_id: str, recent_summary_days: int) -> MemorySnapshot:
+        workspace = self.get_workspace(conversation_id)
+        cache_key = (self._workspace_cache_key(workspace), recent_summary_days)
+        signature = self._snapshot_signature(workspace, recent_summary_days)
+        with self._snapshot_lock:
+            cached = self._snapshot_cache.get(cache_key)
+            if cached is not None and cached.signature == signature:
+                return cached
+
+        if cached is not None:
+            self.refresh_recent_summaries(conversation_id, days_values={recent_summary_days})
+
+        snapshot = MemorySnapshot(
+            memory_text=self.read_memory(conversation_id).strip(),
+            recent_summaries_text=self.read_recent_summaries(workspace=workspace, days=recent_summary_days).strip(),
+            signature=signature,
+        )
+        with self._snapshot_lock:
+            self._snapshot_cache[cache_key] = snapshot
+        return snapshot
+
+    def refresh_snapshot(self, conversation_id: str) -> MemorySnapshot:
+        workspace = self.get_workspace(conversation_id)
+        memory_text = self.read_memory(conversation_id).strip()
+        days_values = self._snapshot_days_for_conversation(conversation_id)
+        recent_summaries = self.refresh_recent_summaries(conversation_id, days_values=days_values)
+        workspace_cache_key = self._workspace_cache_key(workspace)
+        snapshots: dict[tuple[str, int], MemorySnapshot] = {}
+        for days in days_values:
+            snapshots[(workspace_cache_key, days)] = MemorySnapshot(
+                memory_text=memory_text,
+                recent_summaries_text=recent_summaries[(workspace_cache_key, days)].text.strip(),
+                signature=self._snapshot_signature(workspace, days),
+            )
+        with self._snapshot_lock:
+            self._snapshot_cache.update(snapshots)
+        return snapshots[(workspace_cache_key, self.config.recent_summary_days)]
+
+    def refresh_recent_summaries(
+        self,
+        conversation_id: str,
+        *,
+        days_values: set[int] | None = None,
+    ) -> dict[tuple[str, int], RecentSummariesSnapshot]:
+        workspace = self.get_workspace(conversation_id)
+        workspace_cache_key = self._workspace_cache_key(workspace)
+        if days_values is None:
+            days_values = self._snapshot_days_for_conversation(conversation_id)
+        refreshed = {
+            (workspace_cache_key, days): RecentSummariesSnapshot(text=self._read_recent_summaries_from_disk(workspace, days))
+            for days in days_values
+        }
+        with self._recent_summaries_lock:
+            self._recent_summaries_cache.update(refreshed)
+        return refreshed
+
+    def invalidate_snapshot(self, conversation_id: str) -> None:
+        workspace_cache_key = self._workspace_cache_key(self.get_workspace(conversation_id))
+        with self._snapshot_lock:
+            stale_keys = [key for key in self._snapshot_cache if key[0] == workspace_cache_key]
+            for key in stale_keys:
+                self._snapshot_cache.pop(key, None)
+        with self._recent_summaries_lock:
+            stale_summary_keys = [key for key in self._recent_summaries_cache if key[0] == workspace_cache_key]
+            for key in stale_summary_keys:
+                self._recent_summaries_cache.pop(key, None)
+
+    def snapshot_matches_workspace(self, conversation_id: str, recent_summary_days: int) -> bool:
+        workspace = self.get_workspace(conversation_id)
+        cache_key = (self._workspace_cache_key(workspace), recent_summary_days)
+        current_signature = self._snapshot_signature(workspace, recent_summary_days)
+        with self._snapshot_lock:
+            cached = self._snapshot_cache.get(cache_key)
+        return cached is not None and cached.signature == current_signature
 
     def search(self, conversation_id: str, query: str, limit: int = 10) -> list[str]:
         workspace = self.get_workspace(conversation_id)
-        lowered = query.lower()
-        matches: list[str] = []
-        for file_path in self._iter_memory_files(workspace):
-            for line in file_path.read_text(encoding="utf-8").splitlines():
-                if lowered in line.lower():
-                    matches.append(f"{file_path.name}: {line.strip()}")
-                    if len(matches) >= limit:
-                        return matches
-        return matches
+        normalized_query = self._normalize_item(query)
+        if not normalized_query or limit <= 0:
+            return []
+
+        memory_hits = self._search_memory_file(workspace, normalized_query)
+        summary_hits = self._search_summary_files(workspace, normalized_query)
+        higher_layer_hits = [*memory_hits, *summary_hits]
+        higher_layer_count = len(higher_layer_hits)
+        log_limit = max(0, limit - higher_layer_count)
+        if higher_layer_count:
+            log_limit = min(log_limit, MAX_LOG_RESULTS_WHEN_HIGHER_LAYERS_HIT)
+
+        log_hits = self._search_log_files(workspace, normalized_query, limit=log_limit)
+        ranked = sorted([*higher_layer_hits, *log_hits], key=lambda hit: (-hit.score, hit.text))
+        return [hit.text for hit in ranked[:limit]]
 
     def list_by_date(self, conversation_id: str, start_date: str, end_date: str) -> list[str]:
         workspace = self.get_workspace(conversation_id)
@@ -94,12 +313,314 @@ class MemoryStore:
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
 
-    def _iter_memory_files(self, workspace: Path) -> list[Path]:
-        files: list[Path] = []
+    def _snapshot_signature(self, workspace: Path, days: int) -> tuple[tuple[str, int], ...]:
         memory_file = workspace / "MEMORY.md"
+        signatures: list[tuple[str, int]] = []
         if memory_file.exists():
-            files.append(memory_file)
-        for directory in [workspace / "summaries", workspace / "logs"]:
-            if directory.exists():
-                files.extend(sorted(directory.glob("*.md"), reverse=True))
-        return files
+            signatures.append(("MEMORY.md", int(memory_file.stat().st_mtime_ns)))
+
+        summaries_dir = workspace / "summaries"
+        if summaries_dir.exists():
+            for path in sorted(summaries_dir.glob("*.md"), reverse=True)[:days]:
+                if path.exists():
+                    relative_name = path.relative_to(workspace).as_posix()
+                    signatures.append((relative_name, int(path.stat().st_mtime_ns)))
+        return tuple(signatures)
+
+    def _snapshot_days_for_conversation(self, conversation_id: str) -> set[int]:
+        workspace_cache_key = self._workspace_cache_key(self.get_workspace(conversation_id))
+        with self._snapshot_lock:
+            days_values = {days for cached_workspace_key, days in self._snapshot_cache if cached_workspace_key == workspace_cache_key}
+        if not days_values:
+            return {self.config.recent_summary_days}
+        days_values.add(self.config.recent_summary_days)
+        return days_values
+
+    @staticmethod
+    def _workspace_cache_key(workspace: Path) -> str:
+        return str(workspace.resolve())
+
+    def _read_recent_summaries_from_disk(self, workspace: Path, days: int) -> str:
+        summaries_dir = workspace / "summaries"
+        if not summaries_dir.exists():
+            return ""
+        files = sorted(summaries_dir.glob("*.md"), reverse=True)[:days]
+        return "\n\n".join(path.read_text(encoding="utf-8").strip() for path in files if path.exists())
+
+    def _search_memory_file(self, workspace: Path, query: str) -> list[SearchHit]:
+        memory_file = workspace / "MEMORY.md"
+        if not memory_file.exists():
+            return []
+
+        metadata = _load_memory_metadata(memory_file)
+        metadata_by_section = {
+            section_name: {
+                self._normalize_item(entry.get("content", "")): entry
+                for entry in entries
+                if self._normalize_item(entry.get("content", ""))
+            }
+            for section_name, entries in metadata.items()
+        }
+
+        hits: list[SearchHit] = []
+        current_section = ""
+        relative_name = memory_file.relative_to(workspace).as_posix()
+        for raw_line in memory_file.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("## "):
+                current_section = SECTION_ALIASES.get(stripped.removeprefix("## ").strip(), stripped.removeprefix("## ").strip())
+                continue
+            if not stripped.startswith("- "):
+                continue
+            content = self._normalize_item(stripped[2:])
+            score = self._score_match(content, query)
+            if score <= 0:
+                continue
+            section_boost = SECTION_RELEVANCE_BOOSTS.get(current_section, 50)
+            metadata_boost = self._metadata_score(metadata_by_section.get(current_section, {}).get(content))
+            hits.append(
+                SearchHit(
+                    text=f"{relative_name}: {stripped}",
+                    score=score + section_boost + metadata_boost,
+                    layer=LAYER_MEMORY,
+                )
+            )
+        return hits
+
+    def _search_summary_files(self, workspace: Path, query: str) -> list[SearchHit]:
+        summaries_dir = workspace / "summaries"
+        if not summaries_dir.exists():
+            return []
+
+        hits: list[SearchHit] = []
+        for file_path in sorted(summaries_dir.glob("*.md"), reverse=True):
+            relative_name = file_path.relative_to(workspace).as_posix()
+            current_heading = ""
+            for raw_line in file_path.read_text(encoding="utf-8").splitlines():
+                stripped = raw_line.strip()
+                if stripped.startswith("### "):
+                    current_heading = stripped
+                    continue
+                if not stripped.startswith("- "):
+                    continue
+                content = self._normalize_item(stripped[2:])
+                score = self._score_match(content, query)
+                if score <= 0:
+                    continue
+                heading_boost = SUMMARY_RELEVANCE_BOOST if current_heading in HIGH_PRIORITY_SUMMARY_HEADINGS else 40
+                hits.append(
+                    SearchHit(
+                        text=f"{relative_name}: {stripped}",
+                        score=score + heading_boost,
+                        layer=LAYER_SUMMARY,
+                    )
+                )
+        return hits
+
+    def _search_log_files(self, workspace: Path, query: str, limit: int) -> list[SearchHit]:
+        if limit <= 0:
+            return []
+        logs_dir = workspace / "logs"
+        if not logs_dir.exists():
+            return []
+
+        hits: list[SearchHit] = []
+        for file_path in sorted(logs_dir.glob("*.md"), reverse=True):
+            relative_name = file_path.relative_to(workspace).as_posix()
+            for raw_line in file_path.read_text(encoding="utf-8").splitlines():
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("### "):
+                    continue
+                score = self._score_match(stripped, query)
+                if score <= 0:
+                    continue
+                hits.append(
+                    SearchHit(
+                        text=f"{relative_name}: {stripped}",
+                        score=score + LOG_RELEVANCE_BOOST,
+                        layer=LAYER_LOG,
+                    )
+                )
+        hits.sort(key=lambda hit: (-hit.score, hit.text))
+        return hits[:limit]
+
+    def _read_memory_sections(self, conversation_id: str) -> dict[str, list[str]]:
+        text = self.read_memory(conversation_id)
+        return self._parse_memory_sections(text)
+
+    def _write_memory_sections(
+        self,
+        conversation_id: str,
+        sections: dict[str, list[str]],
+        metadata_updates: dict[str, dict[str, dict[str, str]]] | None = None,
+    ) -> None:
+        workspace = self.get_workspace(conversation_id)
+        memory_file = workspace / "MEMORY.md"
+        if not memory_file.exists():
+            memory_file.write_text(self._serialize_memory_sections(self._default_memory_sections()), encoding="utf-8")
+        _rewrite_memory_sections(
+            memory_file,
+            sections,
+            config=self.config,
+            workspace=workspace,
+            metadata_updates=metadata_updates,
+        )
+
+    def _default_memory_sections(self) -> dict[str, list[str]]:
+        return {name: list(items) for name, items in DEFAULT_MEMORY_ITEMS.items()}
+
+    def _parse_memory_sections(self, text: str) -> dict[str, list[str]]:
+        sections = self._default_memory_sections()
+        extras: dict[str, list[str]] = {}
+        current_section = "Saved Notes"
+
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped == "# Memory":
+                continue
+            if stripped.startswith("## "):
+                section_name = stripped.removeprefix("## ").strip()
+                current_section = SECTION_ALIASES.get(section_name, section_name)
+                target = sections if current_section in REQUIRED_MEMORY_SECTIONS else extras
+                target.setdefault(current_section, [])
+                continue
+            if not stripped.startswith("- "):
+                continue
+            item = self._normalize_item(stripped[2:])
+            if not item:
+                continue
+            target = sections if current_section in REQUIRED_MEMORY_SECTIONS else extras
+            target.setdefault(current_section, []).append(item)
+
+        for name, items in extras.items():
+            sections[name] = items
+        return sections
+
+    def _serialize_memory_sections(self, sections: dict[str, list[str]]) -> str:
+        ordered_names = [*REQUIRED_MEMORY_SECTIONS, *[name for name in sections if name not in REQUIRED_MEMORY_SECTIONS]]
+        lines = ["# Memory", ""]
+
+        for name in ordered_names:
+            items = self._exact_dedupe(sections.get(name, []))
+            lines.append(f"## {name}")
+            lines.extend(f"- {item}" for item in items)
+            lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _exact_dedupe(self, items: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            cleaned = self._normalize_item(item)
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            deduped.append(cleaned)
+        return deduped
+
+    def _score_match(self, text: str, query: str) -> int:
+        normalized_text = self._normalize_item(text).lower()
+        normalized_query = self._normalize_item(query).lower()
+        if not normalized_text or not normalized_query:
+            return 0
+
+        query_tokens = [token for token in normalized_query.split(" ") if token]
+        if not query_tokens:
+            return 0
+
+        score = 0
+        if normalized_text == normalized_query:
+            score += 150
+        elif normalized_query in normalized_text:
+            score += 90
+
+        matched_tokens = sum(1 for token in query_tokens if token in normalized_text)
+        if matched_tokens == 0:
+            return 0
+
+        score += matched_tokens * 20
+        if matched_tokens == len(query_tokens):
+            score += 40
+        score += min(len(normalized_query), 40)
+        return score
+
+    def _metadata_score(self, metadata: dict[str, str] | None) -> int:
+        if not metadata:
+            return 0
+
+        score = 0
+        kind = self._normalize_item(metadata.get("kind", "")).lower()
+        source = self._normalize_item(metadata.get("source", "")).lower()
+        score += KIND_RELEVANCE_BOOSTS.get(kind, 0)
+
+        if source.startswith("summary:"):
+            score += 5
+        else:
+            score += SOURCE_RELEVANCE_BOOSTS.get(source, 0)
+
+        score += self._confidence_boost(metadata.get("confidence", ""))
+        score += self._ttl_boost(metadata)
+        score += self._recency_boost(metadata.get("created_at", ""))
+        return score
+
+    def _confidence_boost(self, confidence: str) -> int:
+        try:
+            value = float(self._normalize_item(confidence))
+        except ValueError:
+            return 0
+        bounded = min(max(value, 0.0), 1.0)
+        return int(round(bounded * CONFIDENCE_MAX_BOOST))
+
+    def _ttl_boost(self, metadata: dict[str, str]) -> int:
+        kind = self._normalize_item(metadata.get("kind", "")).lower()
+        if kind != "context":
+            return 0
+
+        ttl_days = self._parse_positive_int(metadata.get("ttl_days", ""))
+        if ttl_days is None:
+            return 0
+
+        created_at = _parse_timestamp(metadata.get("created_at", ""))
+        if created_at is None:
+            return 0
+
+        age = datetime.now(timezone.utc) - created_at
+        if age.total_seconds() < 0:
+            return TTL_MAX_BOOST
+
+        age_days = age.total_seconds() / 86400
+        if age_days >= ttl_days:
+            return TTL_EXPIRED_PENALTY
+
+        freshness = 1 - (age_days / ttl_days)
+        return max(0, int(round(freshness * TTL_MAX_BOOST)))
+
+    def _recency_boost(self, created_at: str) -> int:
+        parsed = _parse_timestamp(created_at)
+        if parsed is None:
+            return 0
+
+        age = datetime.now(timezone.utc) - parsed
+        if age.total_seconds() < 0:
+            return RECENCY_MAX_BOOST
+
+        age_days = age.total_seconds() / 86400
+        if age_days >= RECENCY_MAX_DAYS:
+            return 0
+
+        freshness = 1 - (age_days / RECENCY_MAX_DAYS)
+        return max(0, int(round(freshness * RECENCY_MAX_BOOST)))
+
+    def _parse_positive_int(self, value: str) -> int | None:
+        normalized = self._normalize_item(value)
+        if not normalized:
+            return None
+        try:
+            parsed = int(normalized)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+
+    def _normalize_item(self, value: str) -> str:
+        return " ".join(value.strip().split())

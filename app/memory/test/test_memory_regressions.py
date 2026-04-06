@@ -1,0 +1,988 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from threading import Event
+from time import sleep
+from unittest.mock import patch
+
+from app.config import AppConfig
+from app.memory.consolidate import (
+    NoteClassification,
+    SummaryGenerationResult,
+    _apply_retention_policy,
+    _apply_summary_updates,
+    _fallback_summary,
+    _generate_summary_updates,
+    _load_consolidation_state,
+    _load_memory_metadata,
+    _load_all_valid_summaries,
+    _merge_generated_notes_into_memory,
+    generate_workspace_summaries,
+    merge_workspace_memory,
+    _semantic_dedupe_entries,
+    consolidate_workspace_memory,
+)
+from app.memory.store import MemoryStore
+from app.memory.worker import (
+    TASK_PRIORITY_APPEND_LOG,
+    TASK_PRIORITY_GENERATE_SUMMARIES,
+    TASK_PRIORITY_MERGE_MEMORY,
+    TASK_PRIORITY_SAVE_NOTE,
+    MemoryTask,
+    MemoryWorker,
+)
+
+
+class MemoryRegressionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.config = AppConfig(
+            feishu_app_id="",
+            feishu_app_secret="",
+            gemini_api_key="",
+            ai_provider="claude",
+            gemini_cli_path="__missing_gemini_cli__",
+            claude_cli_path="__missing_claude_cli__",
+            bot_name="GeminiBot",
+            default_timezone="UTC",
+            workspace_root=root / "workspaces",
+            data_root=root / "data",
+            poll_interval_seconds=30,
+            recent_summary_days=7,
+            card_footer_enabled=True,
+            log_level="INFO",
+        )
+        self.config.ensure_directories()
+        self.store = MemoryStore(self.config)
+        self.conversation_id = "conv-1"
+        self.workspace = self.store.get_workspace(self.conversation_id)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_remember_writes_section_kind_and_source_metadata(self) -> None:
+        with patch("app.memory.consolidate._semantic_note_classification_decision", return_value=None):
+            self.store.save_memory_note(self.conversation_id, "Prefer concise release summaries.")
+
+        memory_text = (self.workspace / "MEMORY.md").read_text(encoding="utf-8")
+        metadata = _load_memory_metadata(self.workspace / "MEMORY.md")
+
+        self.assertIn("## User Preferences", memory_text)
+        self.assertIn("- Prefer concise release summaries.", memory_text)
+        matching_entries = [
+            entry for entry in metadata["User Preferences"] if entry["content"] == "Prefer concise release summaries."
+        ]
+
+        self.assertEqual(len(matching_entries), 1)
+        self.assertEqual(
+            {**matching_entries[0], "created_at": "<dynamic>"},
+            {
+                "content": "Prefer concise release summaries.",
+                "created_at": "<dynamic>",
+                "source": "remember",
+                "section": "User Preferences",
+                "kind": "preference",
+                "confidence": "0.7",
+                "ttl_days": "",
+            },
+        )
+
+    def test_semantic_dedupe_keeps_canonical_entry(self) -> None:
+        entries = [
+            {
+                "content": "Prefer concise responses.",
+                "created_at": "2026-04-01T10:00:00+00:00",
+                "source": "remember",
+                "section": "User Preferences",
+                "kind": "preference",
+                "confidence": "0.6",
+                "ttl_days": "",
+            },
+            {
+                "content": "The user prefers concise responses.",
+                "created_at": "2026-04-02T10:00:00+00:00",
+                "source": "summary:2026-04-02",
+                "section": "User Preferences",
+                "kind": "preference",
+                "confidence": "0.9",
+                "ttl_days": "",
+            },
+        ]
+
+        with patch(
+            "app.memory.consolidate._semantic_duplicate_decision",
+            return_value={"duplicate_of": 0, "canonical": "Prefer concise responses."},
+        ):
+            deduped = _semantic_dedupe_entries(
+                "User Preferences",
+                entries,
+                config=self.config,
+                workspace=self.workspace,
+            )
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["content"], "Prefer concise responses.")
+        self.assertEqual(deduped[0]["kind"], "preference")
+        self.assertEqual(deduped[0]["confidence"], "0.9")
+        self.assertEqual(deduped[0]["created_at"], "2026-04-02T10:00:00+00:00")
+
+    def test_context_ttl_drops_only_expired_entries(self) -> None:
+        retained = _apply_retention_policy(
+            "Saved Notes",
+            [
+                {
+                    "content": "Temporary release focus.",
+                    "created_at": "2026-03-20T00:00:00+00:00",
+                    "source": "remember",
+                    "section": "Saved Notes",
+                    "kind": "context",
+                    "confidence": "0.8",
+                    "ttl_days": "7",
+                },
+                {
+                    "content": "Current release owner is Liang.",
+                    "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "source": "remember",
+                    "section": "Saved Notes",
+                    "kind": "context",
+                    "confidence": "0.8",
+                    "ttl_days": "7",
+                },
+                {
+                    "content": "Release notes follow the release workflow.",
+                    "created_at": "2026-03-20T00:00:00+00:00",
+                    "source": "remember",
+                    "section": "Saved Notes",
+                    "kind": "note",
+                    "confidence": "0.8",
+                    "ttl_days": "",
+                },
+            ],
+        )
+
+        retained_contents = {entry["content"] for entry in retained}
+        self.assertNotIn("Temporary release focus.", retained_contents)
+        self.assertIn("Current release owner is Liang.", retained_contents)
+        self.assertIn("Release notes follow the release workflow.", retained_contents)
+
+    def test_low_confidence_trim_only_applies_to_saved_notes(self) -> None:
+        saved_notes = [
+            {
+                "content": f"Weak saved note {index}",
+                "created_at": (datetime(2026, 4, 2, tzinfo=timezone.utc) + timedelta(minutes=index)).isoformat(timespec="seconds"),
+                "source": "summary:2026-04-02",
+                "section": "Saved Notes",
+                "kind": "low_confidence",
+                "confidence": "0.4",
+                "ttl_days": "",
+            }
+            for index in range(25)
+        ]
+        saved_notes.append(
+            {
+                "content": "High value saved note",
+                "created_at": "2026-04-02T12:00:00+00:00",
+                "source": "remember",
+                "section": "Saved Notes",
+                "kind": "note",
+                "confidence": "0.9",
+                "ttl_days": "",
+            }
+        )
+        stable_facts = [
+            {
+                "content": f"Fact {index}",
+                "created_at": "2026-04-02T12:00:00+00:00",
+                "source": "remember",
+                "section": "Stable Facts",
+                "kind": "low_confidence",
+                "confidence": "0.4",
+                "ttl_days": "",
+            }
+            for index in range(25)
+        ]
+
+        trimmed_saved_notes = _apply_retention_policy("Saved Notes", saved_notes)
+        untouched_facts = _apply_retention_policy("Stable Facts", stable_facts)
+
+        low_conf_saved = [entry for entry in trimmed_saved_notes if entry["kind"] == "low_confidence"]
+        self.assertEqual(len(low_conf_saved), 20)
+        self.assertIn("High value saved note", {entry["content"] for entry in trimmed_saved_notes})
+        self.assertEqual(len(untouched_facts), 25)
+
+    def test_search_keeps_memory_above_summary_above_logs(self) -> None:
+        (self.workspace / "MEMORY.md").write_text(
+            "# Memory\n\n"
+            "## User Preferences\n"
+            "- Prefer concise release notes.\n\n"
+            "## Stable Facts\n"
+            "- Release workflow owns release notes.\n\n"
+            "## Saved Notes\n"
+            "- Release notes are shared after approval.\n",
+            encoding="utf-8",
+        )
+        (self.workspace / "MEMORY.meta.json").write_text(
+            """
+{
+  "version": 1,
+  "sections": {
+    "User Preferences": [
+      {
+        "content": "Prefer concise release notes.",
+        "created_at": "2026-04-02T12:00:00+00:00",
+        "source": "remember",
+        "section": "User Preferences",
+        "kind": "preference",
+        "confidence": "0.95",
+        "ttl_days": ""
+      }
+    ],
+    "Stable Facts": [
+      {
+        "content": "Release workflow owns release notes.",
+        "created_at": "2026-04-02T12:00:00+00:00",
+        "source": "remember",
+        "section": "Stable Facts",
+        "kind": "fact",
+        "confidence": "0.85",
+        "ttl_days": ""
+      }
+    ],
+    "Saved Notes": [
+      {
+        "content": "Release notes are shared after approval.",
+        "created_at": "2026-04-02T12:00:00+00:00",
+        "source": "remember",
+        "section": "Saved Notes",
+        "kind": "note",
+        "confidence": "0.7",
+        "ttl_days": ""
+      }
+    ]
+  }
+}
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        summaries_dir = self.workspace / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        (summaries_dir / "2026-04-02.md").write_text(
+            "## 2026-04-02\n"
+            "### Semantic Summary\n"
+            "- Release notes were reviewed for concise wording.\n"
+            "### Potential Long-Term Notes\n"
+            "- None\n",
+            encoding="utf-8",
+        )
+        logs_dir = self.workspace / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "2026-04-02.md").write_text(
+            "### 12:00:00\n"
+            "**Q:** Please tighten the release notes wording.\n\n"
+            "**A:** I made the release notes concise.\n",
+            encoding="utf-8",
+        )
+
+        results = self.store.search(self.conversation_id, "concise release notes", limit=5)
+
+        self.assertTrue(results[0].startswith("MEMORY.md:"))
+        summary_index = next(index for index, item in enumerate(results) if item.startswith("summaries/"))
+        log_index = next(index for index, item in enumerate(results) if item.startswith("logs/"))
+        self.assertLess(summary_index, log_index)
+
+    def test_consolidate_preserves_existing_valid_summary_when_fallback_runs(self) -> None:
+        logs_dir = self.workspace / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "2026-04-01.md").write_text(
+            "### 09:00:00\n"
+            "**Q:** Please remember the release style.\n\n"
+            "**A:** Stored the release style preference.\n",
+            encoding="utf-8",
+        )
+        summary_file = self.workspace / "summaries" / f"{date.today().isoformat()}.md"
+        summary_file.parent.mkdir(parents=True, exist_ok=True)
+        summary_file.write_text(
+            "## 2026-04-01\n"
+            "### Semantic Summary\n"
+            "- Stored a durable release style preference.\n"
+            "### Potential Long-Term Notes\n"
+            "- Prefer concise release notes.\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "app.memory.consolidate._generate_semantic_summary",
+            return_value=SummaryGenerationResult(
+                text=_fallback_summary("2026-04-01", (logs_dir / "2026-04-01.md").read_text(encoding="utf-8"), reason="cli failed"),
+                fallback_reason="cli failed",
+            ),
+        ):
+            consolidate_workspace_memory(self.workspace, config=self.config)
+
+        rewritten = summary_file.read_text(encoding="utf-8")
+        self.assertIn("- Stored a durable release style preference.", rewritten)
+        self.assertNotIn("Semantic summary unavailable", rewritten)
+
+    def test_consolidate_only_processes_new_or_changed_logs(self) -> None:
+        logs_dir = self.workspace / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "2026-04-01.md").write_text(
+            "### 09:00:00\n"
+            "**Q:** Remember the release style.\n\n"
+            "**A:** Stored the release style.\n",
+            encoding="utf-8",
+        )
+
+        call_log: list[str] = []
+
+        def fake_generate(log_date: str, log_content: str, workspace: Path, config: AppConfig | None) -> SummaryGenerationResult:
+            call_log.append(log_date)
+            return SummaryGenerationResult(
+                text=(
+                    f"## {log_date}\n"
+                    "### Semantic Summary\n"
+                    f"- Summarized {log_date}.\n"
+                    "### Potential Long-Term Notes\n"
+                    "- None\n"
+                )
+            )
+
+        with patch("app.memory.consolidate._generate_semantic_summary", side_effect=fake_generate):
+            consolidate_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(call_log, ["2026-04-01"])
+
+            consolidate_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(call_log, ["2026-04-01"])
+
+            (logs_dir / "2026-04-02.md").write_text(
+                "### 10:00:00\n"
+                "**Q:** What changed today?\n\n"
+                "**A:** Captured today's update.\n",
+                encoding="utf-8",
+            )
+            consolidate_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(call_log, ["2026-04-01", "2026-04-02"])
+
+            (logs_dir / "2026-04-01.md").write_text(
+                "### 09:00:00\n"
+                "**Q:** Remember the release style.\n\n"
+                "**A:** Stored the updated release style.\n",
+                encoding="utf-8",
+            )
+            consolidate_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(call_log, ["2026-04-01", "2026-04-02", "2026-04-01"])
+
+        state = _load_consolidation_state(self.workspace)
+        self.assertEqual(state.last_consolidated_log, "2026-04-02")
+        self.assertIn("2026-04-01", state.log_hashes)
+        self.assertIn("2026-04-02", state.log_hashes)
+
+    def test_consolidate_appends_new_summary_block_without_rewriting_existing_blocks(self) -> None:
+        logs_dir = self.workspace / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "2026-04-01.md").write_text(
+            "### 09:00:00\n"
+            "**Q:** Save a note.\n\n"
+            "**A:** Saved it.\n",
+            encoding="utf-8",
+        )
+        (logs_dir / "2026-04-02.md").write_text(
+            "### 09:00:00\n"
+            "**Q:** Save another note.\n\n"
+            "**A:** Saved it too.\n",
+            encoding="utf-8",
+        )
+        summary_file = self.workspace / "summaries" / f"{date.today().isoformat()}.md"
+        summary_file.parent.mkdir(parents=True, exist_ok=True)
+        summary_file.write_text(
+            "## 2026-04-01\n"
+            "### Semantic Summary\n"
+            "- Existing summary block.\n"
+            "### Potential Long-Term Notes\n"
+            "- None\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "app.memory.consolidate._generate_semantic_summary",
+            return_value=SummaryGenerationResult(
+                text=(
+                    "## 2026-04-02\n"
+                    "### Semantic Summary\n"
+                    "- Appended summary block.\n"
+                    "### Potential Long-Term Notes\n"
+                    "- None\n"
+                )
+            ),
+        ):
+            consolidate_workspace_memory(self.workspace, config=self.config)
+
+        rewritten = summary_file.read_text(encoding="utf-8")
+        self.assertIn("## 2026-04-01", rewritten)
+        self.assertIn("- Existing summary block.", rewritten)
+        self.assertIn("## 2026-04-02", rewritten)
+        self.assertIn("- Appended summary block.", rewritten)
+
+    def test_generate_summary_updates_separates_summary_stage_from_memory_merge(self) -> None:
+        logs_dir = self.workspace / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "2026-04-01.md").write_text(
+            "### 09:00:00\n"
+            "**Q:** Remember the release style.\n\n"
+            "**A:** Stored the release style.\n",
+            encoding="utf-8",
+        )
+        state = _load_consolidation_state(self.workspace)
+
+        with patch(
+            "app.memory.consolidate._generate_semantic_summary",
+            return_value=SummaryGenerationResult(
+                text=(
+                    "## 2026-04-01\n"
+                    "### Semantic Summary\n"
+                    "- Summarized 2026-04-01.\n"
+                    "### Potential Long-Term Notes\n"
+                    "- Prefer concise release notes.\n"
+                )
+            ),
+        ):
+            updates, last_processed = _generate_summary_updates(
+                workspace=self.workspace,
+                log_files=sorted(logs_dir.glob("*.md")),
+                existing_valid_summaries={},
+                state=state,
+                config=self.config,
+            )
+
+        self.assertEqual(last_processed, "2026-04-01")
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0].log_date, "2026-04-01")
+        self.assertIsNotNone(updates[0].parsed)
+
+        summary_file = self.workspace / "summaries" / f"{date.today().isoformat()}.md"
+        summary_map: dict[str, str] = {}
+        _apply_summary_updates(summary_file, summary_map, updates)
+        self.assertIn("Summarized 2026-04-01.", summary_file.read_text(encoding="utf-8"))
+
+        _merge_generated_notes_into_memory(self.workspace, updates, config=self.config)
+        memory_text = (self.workspace / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertIn("Prefer concise release notes.", memory_text)
+
+    def test_generate_and_merge_workspace_memory_can_run_as_two_tasks(self) -> None:
+        logs_dir = self.workspace / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "2026-04-01.md").write_text(
+            "### 09:00:00\n"
+            "**Q:** Remember the release style.\n\n"
+            "**A:** Stored the release style.\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "app.memory.consolidate._generate_semantic_summary",
+            return_value=SummaryGenerationResult(
+                text=(
+                    "## 2026-04-01\n"
+                    "### Semantic Summary\n"
+                    "- Summarized 2026-04-01.\n"
+                    "### Potential Long-Term Notes\n"
+                    "- Prefer concise release notes.\n"
+                )
+            ),
+        ):
+            generate_workspace_summaries(self.workspace, config=self.config)
+
+        summaries = _load_all_valid_summaries(self.workspace / "summaries")
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0].log_date, "2026-04-01")
+
+        merge_workspace_memory(self.workspace, config=self.config)
+        memory_text = (self.workspace / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertIn("Prefer concise release notes.", memory_text)
+
+    def test_merge_workspace_memory_skips_unchanged_summaries(self) -> None:
+        summaries_dir = self.workspace / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        (summaries_dir / "2026-04-03.md").write_text(
+            "## 2026-04-03\n"
+            "### Semantic Summary\n"
+            "- Stable summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- Prefer concise release notes.\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "app.memory.consolidate._classify_note_semantics",
+            return_value=NoteClassification(
+                section="User Preferences",
+                kind="preference",
+                confidence=0.9,
+                ttl_days=None,
+            ),
+        ) as classify:
+            merge_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(classify.call_count, 1)
+            merge_workspace_memory(self.workspace, config=self.config)
+            self.assertEqual(classify.call_count, 1)
+
+        state = _load_consolidation_state(self.workspace)
+        self.assertIn("2026-04-03", state.merge_summary_hashes)
+        self.assertIn("2026-04-03", state.merge_summary_files)
+
+    def test_merge_workspace_memory_replaces_changed_summary_notes_for_same_date(self) -> None:
+        summaries_dir = self.workspace / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        summary_file = summaries_dir / "2026-04-03.md"
+        summary_file.write_text(
+            "## 2026-04-03\n"
+            "### Semantic Summary\n"
+            "- First summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- Prefer concise release notes.\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "app.memory.consolidate._classify_note_semantics",
+            side_effect=[
+                NoteClassification("User Preferences", "preference", 0.9, None),
+                NoteClassification("User Preferences", "preference", 0.9, None),
+            ],
+        ):
+            merge_workspace_memory(self.workspace, config=self.config)
+            summary_file.write_text(
+                "## 2026-04-03\n"
+                "### Semantic Summary\n"
+                "- Updated summary.\n"
+                "### Potential Long-Term Notes\n"
+                "- Prefer terse release notes.\n",
+                encoding="utf-8",
+            )
+            merge_workspace_memory(self.workspace, config=self.config)
+
+        memory_text = (self.workspace / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertNotIn("Prefer concise release notes.", memory_text)
+        self.assertIn("Prefer terse release notes.", memory_text)
+
+    def test_merge_workspace_memory_rebuilds_when_summary_file_is_removed(self) -> None:
+        summaries_dir = self.workspace / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        summary_file = summaries_dir / "2026-04-03.md"
+        summary_file.write_text(
+            "## 2026-04-03\n"
+            "### Semantic Summary\n"
+            "- First summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- Prefer concise release notes.\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "app.memory.consolidate._classify_note_semantics",
+            return_value=NoteClassification(
+                section="User Preferences",
+                kind="preference",
+                confidence=0.9,
+                ttl_days=None,
+            ),
+        ):
+            merge_workspace_memory(self.workspace, config=self.config)
+
+        summary_file.unlink()
+        merge_workspace_memory(self.workspace, config=self.config)
+
+        memory_text = (self.workspace / "MEMORY.md").read_text(encoding="utf-8")
+        self.assertNotIn("Prefer concise release notes.", memory_text)
+
+    def test_read_recent_summaries_reuses_cache_until_worker_refresh(self) -> None:
+        summaries_dir = self.workspace / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        (summaries_dir / "2026-04-03.md").write_text(
+            "## 2026-04-03\n"
+            "### Semantic Summary\n"
+            "- First summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- None\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(self.store, "_read_recent_summaries_from_disk", wraps=self.store._read_recent_summaries_from_disk) as read_disk:
+            first = self.store.read_recent_summaries(self.workspace, 7)
+            second = self.store.read_recent_summaries(self.workspace, 7)
+
+            self.assertEqual(first, second)
+            self.assertEqual(read_disk.call_count, 1)
+
+            (summaries_dir / "2026-04-04.md").write_text(
+                "## 2026-04-04\n"
+                "### Semantic Summary\n"
+                "- Updated summary.\n"
+                "### Potential Long-Term Notes\n"
+                "- None\n",
+                encoding="utf-8",
+            )
+
+            cached = self.store.read_recent_summaries(self.workspace, 7)
+            self.assertNotIn("Updated summary.", cached)
+            self.assertEqual(read_disk.call_count, 1)
+
+            refreshed = self.store.refresh_recent_summaries(self.conversation_id)
+            self.assertIn(
+                "Updated summary.",
+                refreshed[(str(self.workspace.resolve()), 7)].text,
+            )
+
+            third = self.store.read_recent_summaries(self.workspace, 7)
+            self.assertIn("Updated summary.", third)
+            self.assertEqual(read_disk.call_count, 2)
+
+    def test_read_snapshot_refreshes_when_memory_or_summaries_change(self) -> None:
+        (self.workspace / "MEMORY.md").write_text(
+            "# Memory\n\n"
+            "## User Preferences\n"
+            "- Prefer concise replies.\n\n"
+            "## Stable Facts\n\n"
+            "## Saved Notes\n",
+            encoding="utf-8",
+        )
+        summaries_dir = self.workspace / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        (summaries_dir / "2026-04-03.md").write_text(
+            "## 2026-04-03\n"
+            "### Semantic Summary\n"
+            "- First summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- None\n",
+            encoding="utf-8",
+        )
+
+        first = self.store.read_snapshot(self.conversation_id, recent_summary_days=7)
+        self.assertIn("Prefer concise replies.", first.memory_text)
+        self.assertIn("First summary.", first.recent_summaries_text)
+
+        (self.workspace / "MEMORY.md").write_text(
+            "# Memory\n\n"
+            "## User Preferences\n"
+            "- Prefer concise replies.\n"
+            "- Prefer short status updates.\n\n"
+            "## Stable Facts\n\n"
+            "## Saved Notes\n",
+            encoding="utf-8",
+        )
+        (summaries_dir / "2026-04-04.md").write_text(
+            "## 2026-04-04\n"
+            "### Semantic Summary\n"
+            "- Updated summary.\n"
+            "### Potential Long-Term Notes\n"
+            "- None\n",
+            encoding="utf-8",
+        )
+
+        refreshed = self.store.read_snapshot(self.conversation_id, recent_summary_days=7)
+        self.assertIn("Prefer short status updates.", refreshed.memory_text)
+        self.assertIn("Updated summary.", refreshed.recent_summaries_text)
+
+    def test_memory_worker_refreshes_snapshot_after_memory_write(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        try:
+            snapshot = self.store.read_snapshot(self.conversation_id, recent_summary_days=7)
+            self.assertNotIn("Prefer concise release summaries.", snapshot.memory_text)
+
+            worker.submit_save_memory_note(self.conversation_id, "Prefer concise release summaries.")
+            worker.stop()
+
+            refreshed = self.store.read_snapshot(self.conversation_id, recent_summary_days=7)
+            self.assertIn("Prefer concise release summaries.", refreshed.memory_text)
+            self.assertTrue(self.store.snapshot_matches_workspace(self.conversation_id, recent_summary_days=7))
+        finally:
+            worker.stop()
+
+    def test_memory_worker_batches_adjacent_save_note_tasks(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        save_batches: list[list[str]] = []
+
+        with patch.object(worker.store, "save_memory_notes") as save_memory_notes:
+            def capture(conversation_id: str, contents: list[str]) -> None:
+                save_batches.append(list(contents))
+                sleep(0.01)
+
+            save_memory_notes.side_effect = capture
+            try:
+                worker.submit_save_memory_note(self.conversation_id, "Prefer concise replies.")
+                worker.submit_save_memory_note(self.conversation_id, "Prefer terse status updates.")
+                worker.submit_save_memory_note(self.conversation_id, "Avoid verbose summaries.")
+                worker.stop()
+            finally:
+                worker.stop()
+
+        self.assertEqual(
+            save_batches,
+            [[
+                "Prefer concise replies.",
+                "Prefer terse status updates.",
+                "Avoid verbose summaries.",
+            ]],
+        )
+
+    def test_memory_worker_offloads_summary_generation_and_keeps_light_tasks_responsive(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        heavy_started = Event()
+        release_heavy = Event()
+        log_done = Event()
+        note_done = Event()
+        merge_done = Event()
+        execution: list[str] = []
+
+        def run_heavy(conversation_id: str) -> None:
+            execution.append(f"heavy-start:{conversation_id}")
+            heavy_started.set()
+            release_heavy.wait(timeout=2)
+            execution.append(f"heavy-end:{conversation_id}")
+
+        def append_log(*, conversation_id: str, user_text: str, assistant_text: str) -> None:
+            execution.append("append-log")
+            log_done.set()
+
+        def save_notes(conversation_id: str, contents: list[str]) -> None:
+            execution.append("save-note")
+            note_done.set()
+
+        def merge_memory(conversation_id: str) -> None:
+            execution.append(f"merge:{conversation_id}")
+            merge_done.set()
+
+        with (
+            patch.object(worker, "_run_generate_workspace_summaries", side_effect=run_heavy),
+            patch.object(worker.store, "append_daily_log", side_effect=append_log),
+            patch.object(worker.store, "save_memory_notes", side_effect=save_notes),
+            patch.object(worker.store, "refresh_snapshot"),
+            patch.object(worker, "_merge_workspace_memory", side_effect=merge_memory),
+        ):
+            try:
+                worker.submit_generate_workspace_summaries(self.conversation_id)
+                self.assertTrue(heavy_started.wait(timeout=2))
+
+                worker.submit_append_daily_log(self.conversation_id, "u", "a")
+                worker.submit_save_memory_note(self.conversation_id, "Prefer concise replies.")
+
+                self.assertTrue(log_done.wait(timeout=2))
+                self.assertTrue(note_done.wait(timeout=2))
+                self.assertFalse(merge_done.is_set())
+
+                release_heavy.set()
+                self.assertTrue(merge_done.wait(timeout=2))
+            finally:
+                release_heavy.set()
+                worker.stop()
+
+        self.assertEqual(execution[:3], [f"heavy-start:{self.conversation_id}", "append-log", "save-note"])
+        self.assertEqual(execution[-2:], [f"heavy-end:{self.conversation_id}", f"merge:{self.conversation_id}"])
+
+    def test_memory_worker_coalesces_summary_generation_requests(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        first_started = Event()
+        release_first = Event()
+        second_started = Event()
+        release_second = Event()
+        second_can_run = Event()
+        merge_done = Event()
+        runs: list[str] = []
+
+        def run_heavy(conversation_id: str) -> None:
+            run_number = len(runs) + 1
+            runs.append(f"run-{run_number}:{conversation_id}")
+            if run_number == 1:
+                first_started.set()
+                release_first.wait(timeout=2)
+                second_can_run.set()
+                return
+            second_started.set()
+            release_second.wait(timeout=2)
+
+        def merge_memory(conversation_id: str) -> None:
+            merge_done.set()
+
+        with (
+            patch.object(worker, "_run_generate_workspace_summaries", side_effect=run_heavy),
+            patch.object(worker, "_merge_workspace_memory", side_effect=merge_memory),
+            patch.object(worker.store, "refresh_snapshot"),
+        ):
+            try:
+                worker.submit_generate_workspace_summaries(self.conversation_id)
+                self.assertTrue(first_started.wait(timeout=2))
+
+                worker.submit_generate_workspace_summaries(self.conversation_id)
+                sleep(0.05)
+                self.assertEqual(runs, [f"run-1:{self.conversation_id}"])
+
+                release_first.set()
+                self.assertTrue(second_can_run.wait(timeout=2))
+                self.assertTrue(second_started.wait(timeout=2))
+                release_second.set()
+                self.assertTrue(merge_done.wait(timeout=2))
+            finally:
+                release_first.set()
+                release_second.set()
+                worker.stop()
+
+        self.assertEqual(runs, [f"run-1:{self.conversation_id}", f"run-2:{self.conversation_id}"])
+
+    def test_memory_worker_prioritizes_light_tasks_within_conversation(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        execution: list[str] = []
+        heavy_started = Event()
+        release_heavy = Event()
+        log_done = Event()
+        note_done = Event()
+
+        def make_task(
+            conversation_id: str,
+            label: str,
+            *,
+            priority: int,
+            start_event: Event | None = None,
+            wait_event: Event | None = None,
+            finish_event: Event | None = None,
+        ) -> MemoryTask:
+            def run() -> None:
+                execution.append(f"start:{label}")
+                if start_event is not None:
+                    start_event.set()
+                if wait_event is not None:
+                    wait_event.wait(timeout=2)
+                execution.append(f"end:{label}")
+                if finish_event is not None:
+                    finish_event.set()
+
+            return MemoryTask(
+                conversation_id=conversation_id,
+                description=label,
+                run=run,
+                priority=priority,
+            )
+
+        try:
+            worker._submit(
+                make_task(
+                    "conv-1",
+                    "heavy-merge",
+                    priority=TASK_PRIORITY_MERGE_MEMORY,
+                    start_event=heavy_started,
+                    wait_event=release_heavy,
+                )
+            )
+            self.assertTrue(heavy_started.wait(timeout=2))
+
+            worker._submit(
+                make_task(
+                    "conv-1",
+                    "append-log",
+                    priority=TASK_PRIORITY_APPEND_LOG,
+                    finish_event=log_done,
+                )
+            )
+            worker._submit(
+                make_task(
+                    "conv-1",
+                    "save-note",
+                    priority=TASK_PRIORITY_SAVE_NOTE,
+                    finish_event=note_done,
+                )
+            )
+            worker._submit(
+                make_task(
+                    "conv-1",
+                    "generate-summaries",
+                    priority=TASK_PRIORITY_GENERATE_SUMMARIES,
+                )
+            )
+
+            release_heavy.set()
+            self.assertTrue(log_done.wait(timeout=2))
+            self.assertTrue(note_done.wait(timeout=2))
+
+            self.assertEqual(
+                execution,
+                [
+                    "start:heavy-merge",
+                    "end:heavy-merge",
+                    "start:append-log",
+                    "end:append-log",
+                    "start:save-note",
+                    "end:save-note",
+                    "start:generate-summaries",
+                    "end:generate-summaries",
+                ],
+            )
+        finally:
+            release_heavy.set()
+            worker.stop()
+
+    def test_memory_worker_serializes_within_conversation_but_not_globally(self) -> None:
+        worker = MemoryWorker(self.config)
+        worker.start()
+        execution: list[str] = []
+        conv1_started = Event()
+        release_conv1 = Event()
+        conv2_finished = Event()
+        conv1_second_finished = Event()
+
+        def make_task(conversation_id: str, label: str, *, start_event: Event | None = None, wait_event: Event | None = None, finish_event: Event | None = None) -> MemoryTask:
+            def run() -> None:
+                execution.append(f"start:{label}")
+                if start_event is not None:
+                    start_event.set()
+                if wait_event is not None:
+                    wait_event.wait(timeout=2)
+                execution.append(f"end:{label}")
+                if finish_event is not None:
+                    finish_event.set()
+
+            return MemoryTask(
+                conversation_id=conversation_id,
+                description=label,
+                run=run,
+            )
+
+        try:
+            worker._submit(make_task("conv-1", "conv1-first", start_event=conv1_started, wait_event=release_conv1))
+            self.assertTrue(conv1_started.wait(timeout=2))
+
+            worker._submit(make_task("conv-1", "conv1-second", finish_event=conv1_second_finished))
+            worker._submit(make_task("conv-2", "conv2-only", finish_event=conv2_finished))
+
+            self.assertTrue(conv2_finished.wait(timeout=2))
+            self.assertEqual(execution, ["start:conv1-first", "start:conv2-only", "end:conv2-only"])
+
+            release_conv1.set()
+            self.assertTrue(conv1_second_finished.wait(timeout=2))
+
+            self.assertEqual(
+                execution,
+                [
+                    "start:conv1-first",
+                    "start:conv2-only",
+                    "end:conv2-only",
+                    "end:conv1-first",
+                    "start:conv1-second",
+                    "end:conv1-second",
+                ],
+            )
+        finally:
+            release_conv1.set()
+            worker.stop()
+
+
+if __name__ == "__main__":
+    unittest.main()

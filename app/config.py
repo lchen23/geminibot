@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     from dotenv import load_dotenv
@@ -11,12 +13,19 @@ except ModuleNotFoundError:  # pragma: no cover - optional runtime fallback
         return False
 
 
-@dataclass
+@dataclass(slots=True)
+class StartupCheckResult:
+    warnings: list[str]
+
+
+@dataclass(slots=True)
 class AppConfig:
     feishu_app_id: str
     feishu_app_secret: str
     gemini_api_key: str
+    ai_provider: str
     gemini_cli_path: str
+    claude_cli_path: str
     bot_name: str
     default_timezone: str
     workspace_root: Path
@@ -37,7 +46,9 @@ class AppConfig:
             feishu_app_id=os.getenv("FEISHU_APP_ID", ""),
             feishu_app_secret=os.getenv("FEISHU_APP_SECRET", ""),
             gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
+            ai_provider=os.getenv("AI_PROVIDER", "gemini").strip().lower() or "gemini",
             gemini_cli_path=os.getenv("GEMINI_CLI_PATH", "gemini"),
+            claude_cli_path=os.getenv("CLAUDE_CLI_PATH", "claude"),
             bot_name=os.getenv("BOT_NAME", "GeminiBot"),
             default_timezone=os.getenv("DEFAULT_TIMEZONE", "Asia/Shanghai"),
             workspace_root=workspace_root,
@@ -49,6 +60,43 @@ class AppConfig:
         )
         config.ensure_directories()
         return config
+
+    def run_startup_checks(self) -> StartupCheckResult:
+        if not self.feishu_app_id or not self.feishu_app_secret:
+            raise ValueError("Missing required Feishu configuration: FEISHU_APP_ID and FEISHU_APP_SECRET are required.")
+        if self.ai_provider not in {"gemini", "claude"}:
+            raise ValueError(f"Unsupported AI_PROVIDER: {self.ai_provider}")
+
+        cli_path = self.selected_cli_path
+        if not cli_path.strip():
+            raise ValueError(f"Missing required CLI configuration for provider {self.ai_provider}: set the matching CLI path.")
+        if shutil.which(cli_path) is None:
+            raise ValueError(f"Configured {self.ai_provider} CLI was not found on PATH: {cli_path}")
+        if not self.workspace_root.exists() or not self.workspace_root.is_dir():
+            raise ValueError(f"Workspace root is not available: {self.workspace_root}")
+        if not self.data_root.exists() or not self.data_root.is_dir():
+            raise ValueError(f"Data root is not available: {self.data_root}")
+        try:
+            ZoneInfo(self.default_timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"Default timezone is not supported: {self.default_timezone}") from exc
+
+        warnings: list[str] = []
+        if self.ai_provider == "gemini" and not self.gemini_api_key:
+            warnings.append("GEMINI_API_KEY is not set; Gemini CLI must already be authenticated via its own local session.")
+        return StartupCheckResult(warnings=warnings)
+
+    @property
+    def selected_cli_path(self) -> str:
+        if self.ai_provider == "claude":
+            return self.claude_cli_path
+        return self.gemini_cli_path
+
+    @property
+    def context_filename(self) -> str:
+        if self.ai_provider == "claude":
+            return "CLAUDE.md"
+        return "GEMINI.md"
 
     def ensure_directories(self) -> None:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
