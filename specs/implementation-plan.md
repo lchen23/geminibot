@@ -1,345 +1,407 @@
 # GeminiBot Implementation Plan
 
 ## Summary
-This plan turns the existing GeminiBot spec into an executable build sequence. It prioritizes a usable Feishu-to-Gemini chat loop first, then adds durable memory, proactive scheduling, and finally skill extensions. The plan is optimized for a local-first Python service with file-based persistence and minimal infrastructure.
+This plan turns `specs/spec.md` into an executable implementation sequence for a local-first Feishu AI assistant. The system is centered on five core runtime areas: Feishu gateway, dispatcher, provider-selectable agent engine, memory, and scheduler. The plan assumes a lightweight Python service, file-based persistence, and operation on a personal machine or private server.
+
+## Planning Goals
+- Keep the implementation aligned with the current spec and repository shape.
+- Prioritize end-to-end usability over isolated subsystem completeness.
+- Preserve local observability through readable files under `~/geminibot`.
+- Support both Gemini CLI and Claude Code CLI through one adapter layer.
+- Focus follow-up work on hardening and closing known gaps rather than adding new subsystems.
 
 ## Delivery Strategy
-- Build thin vertical slices instead of isolated modules.
-- Keep every milestone runnable end-to-end.
-- Prefer simple file-backed implementations before introducing abstraction.
-- Validate Gemini CLI behavior early because it is the main external dependency risk.
+- Build thin vertical slices first, then harden them.
+- Prefer simple file-backed implementations before introducing more abstraction.
+- Keep one canonical request path for user messages and scheduled tasks.
+- Treat provider differences as adapter concerns, not product-level forks.
+- Make every milestone testable from Feishu or from a local simulation path.
 
 ## Assumptions
-- Gemini CLI Agent is installed locally and can be invoked from shell.
-- Feishu app credentials are available.
 - Python 3.11+ is available.
+- A Feishu app with valid credentials is available.
+- At least one supported CLI runtime is available on `PATH`.
 - Local disk persistence is acceptable for v1.
+- Text messages are the primary interaction mode in v1.
 
 ## Major Risks
-1. Gemini CLI session resume and JSON output behavior may differ from the conceptual model.
-2. Feishu Python SDK WebSocket ergonomics may require adapter code.
-3. Tool bridging between Python and Gemini CLI may need iteration.
-4. Long-running scheduled tasks may overlap without a lock strategy.
+1. Gemini CLI and Claude Code CLI may differ in resume semantics, streaming output, and permission controls.
+2. Feishu WebSocket and card APIs may require fallback logic for local reliability.
+3. Memory consolidation quality may lag behind raw logging correctness.
+4. Long-running scheduled tasks may expose edge cases in overlapping execution and recovery.
+5. JSON-backed state can become fragile without explicit atomic write and corruption-handling rules.
+
+## Current Baseline
+The current design assumes these repository-level decisions:
+- `AI_PROVIDER` selects `gemini` or `claude`.
+- Session metadata is stored in `data/sessions.json`.
+- Workspaces contain persona files, logs, summaries, and local tool bridge assets.
+- Gateway performs deduplication before dispatch.
+- Dispatcher handles built-in commands including `/schedule <once|cron> | <time-or-cron> | <prompt>` and `/delete-task <task_id>`.
+- Memory and scheduler capabilities are exposed through a workspace-local tool bridge.
+
+---
 
 ## Phase 0 — Technical Validation
 ### Goal
-De-risk external integrations before building the full app.
+De-risk the external integrations and confirm the provider model before additional hardening work.
 
 ### Tasks
-- Verify Gemini CLI invocation model:
-  - single prompt execution
-  - structured output mode
-  - resume/session mode
-  - cwd/workspace behavior
+- Verify Gemini CLI behavior for:
+  - one-shot execution
+  - JSON output
+  - stream-json output
+  - resume behavior
+  - workspace cwd behavior
+  - approval mode wiring
+- Verify Claude Code CLI behavior for:
+  - one-shot execution
+  - JSON output
+  - stream-json output
+  - resume behavior
+  - permission mode wiring
 - Verify Feishu WebSocket event subscription in Python.
-- Verify Feishu reply message/card API from Python.
-- Decide the exact tool bridge pattern for Gemini:
-  - direct MCP support if available
-  - command wrapper tools otherwise
+- Verify Feishu card delivery and streaming card update APIs.
+- Verify the local subprocess-based tool bridge contract.
 
 ### Deliverables
-- `notes/gemini-cli-validation.md`
-- `notes/feishu-validation.md`
-- final adapter decisions recorded in spec addendum
+- provider behavior notes
+- validated Feishu integration notes
+- confirmed adapter assumptions for both CLI providers
 
 ### Exit Criteria
-- Can send one Feishu message and manually route it to Gemini CLI, then send a response back.
+- A real or simulated Feishu message can be routed through the selected provider and produce a reply.
+- A tool bridge command can be invoked from a workspace and return structured JSON.
 
-## Phase 1 — Bootstrap Project Skeleton
+---
+
+## Phase 1 — Foundation and Configuration
 ### Goal
-Create a runnable Python service layout with configuration, logging, and startup flow.
+Ensure the service boots reliably with the current file layout and configuration model.
 
 ### Tasks
-- Create package/module structure under `app/`.
-- Add `pyproject.toml`.
-- Add `.env.example`.
-- Add base config loader.
-- Add structured logging utility.
-- Add startup file `app/main.py`.
-- Create initial data files if missing.
+- Maintain package structure under `app/`.
+- Keep `pyproject.toml` and CLI entrypoint current.
+- Maintain `.env.example` in sync with the actual config surface.
+- Keep `AppConfig` aligned with spec fields:
+  - `FEISHU_APP_ID`
+  - `FEISHU_APP_SECRET`
+  - `AI_PROVIDER`
+  - `GEMINI_CLI_PATH`
+  - `CLAUDE_CLI_PATH`
+  - `GEMINI_APPROVAL_MODE`
+  - `CLAUDE_PERMISSION_MODE`
+  - `BOT_NAME`
+  - `APP_ROOT`
+  - `DEFAULT_TIMEZONE`
+- Create required data files when missing.
+- Keep startup checks focused on actionable operator errors.
 
 ### Deliverables
 - runnable `python -m app.main`
-- empty but valid directory layout
+- synchronized `.env.example`, README, and config loader
+- initialized `data/` and `workspaces/` roots
 
 ### Exit Criteria
-- Application starts, loads config, and initializes directories without crashing.
+- Service starts cleanly with valid config.
+- Missing or invalid config yields clear startup failures.
 
-## Phase 2 — Feishu Gateway Vertical Slice
+---
+
+## Phase 2 — Feishu Gateway and Delivery Path
 ### Goal
-Receive real text messages from Feishu and send back a static response.
+Provide a stable Feishu ingress and egress layer for the rest of the system.
 
 ### Tasks
-- Implement `app/gateway/feishu.py`:
-  - client initialization
-  - WebSocket startup
-  - event handler registration
-  - text extraction
-  - card sending helper
-- Implement message dedup store in `data/dedup.json`.
-- Define normalized `IncomingMessage` model.
-- Add a temporary echo/stub dispatcher.
+- Maintain `app/gateway/feishu.py` as the single Feishu integration point.
+- Keep WebSocket connection startup and shutdown logic reliable.
+- Parse inbound Feishu events into normalized `IncomingMessage` values.
+- Deduplicate incoming messages in the gateway using `data/dedup.json`.
+- Support normal reply delivery.
+- Support streaming card replies when the environment allows it.
+- Fall back gracefully from streaming to non-streaming delivery.
+- Persist failed outbound payloads to `data/unsent_messages.json`.
 
 ### Deliverables
-- live Feishu echo bot with Markdown card replies
+- gateway that can receive text messages and deliver replies
+- deduplication and failed-delivery persistence
+- optional streaming card path with fallback
 
 ### Exit Criteria
-- User sends `hello` in Feishu and receives a formatted reply from the Python service.
+- Duplicate messages do not get reprocessed.
+- A reply can be delivered or persisted for inspection if delivery fails.
 
-## Phase 3 — Dispatcher and Core Request Lifecycle
+---
+
+## Phase 3 — Dispatcher and Request Lifecycle
 ### Goal
-Introduce the central orchestration layer.
+Keep one orchestration path for both reactive and proactive execution.
 
 ### Tasks
-- Implement `app/dispatcher.py`.
-- Normalize gateway/scheduler inputs to one internal request shape.
-- Add built-in command parsing for:
+- Maintain `app/dispatcher.py` as the application orchestrator.
+- Normalize gateway and scheduler inputs into one request shape.
+- Keep built-in command handling current for:
   - `/help`
   - `/clear`
-  - `/remember`
+  - `/remember <text>`
   - `/tasks`
-- Add daily log append hook.
-- Add card rendering adapter.
+  - `/schedule <once|cron> | <time-or-cron> | <prompt>`
+  - `/delete-task <task_id>`
+- Support both one-shot reply flow and streaming reply flow.
+- Append daily logs after each completed interaction.
+- Keep scheduler-triggered tasks on the same dispatcher path.
 
 ### Deliverables
-- stable request pipeline with internal command handling
+- stable internal request lifecycle
+- command handling aligned with the current spec
+- shared orchestration path for gateway and scheduler
 
 ### Exit Criteria
-- Gateway no longer replies directly; all responses pass through Dispatcher.
+- All user-visible replies pass through Dispatcher.
+- Scheduled tasks and user messages share the same request lifecycle.
 
-## Phase 4 — Gemini CLI Adapter and Chat Loop
+---
+
+## Phase 4 — Provider-Selectable Agent Engine
 ### Goal
-Replace stub replies with Gemini CLI execution.
+Provide a single adapter layer over Gemini CLI and Claude Code CLI.
 
 ### Tasks
-- Implement `app/agent/engine.py`.
-- Implement `app/agent/workspace.py`.
-- Implement `app/agent/session_store.py`.
-- Create per-conversation workspace bootstrap from templates.
-- Build base system prompt from persona files.
-- Invoke Gemini CLI via subprocess.
-- Parse output and persist session metadata.
-- Return structured result object to Dispatcher.
+- Maintain `app/agent/engine.py`, `workspace.py`, and `session_store.py`.
+- Support provider-specific command construction:
+  - Gemini: `--output-format`, `--resume latest`, `--approval-mode`
+  - Claude: `--output-format`, `--resume <session_id>`, `--permission-mode`
+- Support both non-streaming and stream-json execution.
+- Parse provider output into one internal result model.
+- Persist provider-aware session metadata in `data/sessions.json`.
+- Keep provider-specific context file behavior (`GEMINI.md` / `CLAUDE.md`) internal to the adapter.
+- Ensure workspace cwd behavior stays deterministic.
 
 ### Deliverables
-- end-to-end Feishu -> Dispatcher -> Gemini -> Feishu flow
+- unified internal agent engine API
+- provider-aware session persistence
+- streaming and non-streaming support for both CLIs
 
 ### Exit Criteria
-- Multi-turn conversation works for a single Feishu chat.
+- The same dispatcher call path works with either provider.
+- Sessions survive process restarts via file-backed storage.
 
-## Phase 5 — Persona and Workspace System
+---
+
+## Phase 5 — Workspace and Prompt Assembly
 ### Goal
-Make the assistant feel persistent and personalized.
+Make each conversation persistent, isolated, and inspectable from disk.
 
 ### Tasks
-- Create template files:
+- Maintain per-conversation workspace creation under `workspaces/<conversation_id>/`.
+- Ensure template bootstrap for:
   - `SOUL.md`
   - `IDENTITY.md`
   - `USER.md`
   - `AGENT.md`
   - `MEMORY.md`
-- Implement workspace initialization from templates.
-- Ensure persona files are injected on every agent run.
-- Add session metadata file per workspace.
+- Maintain `logs/`, `summaries/`, and `tools/` subdirectories.
+- Assemble prompts from:
+  1. persona files
+  2. long-term memory
+  3. recent summaries
+  4. tool bridge guide
+  5. optional proactive task context
+- Keep workspace contents human-readable and editable.
 
 ### Deliverables
-- personalized per-conversation workspace model
+- consistent per-conversation workspace layout
+- stable prompt assembly behavior
 
 ### Exit Criteria
-- Editing workspace persona files changes assistant behavior on the next turn.
+- Editing workspace context files changes the next agent turn.
+- Conversations remain isolated from each other.
+
+---
 
 ## Phase 6 — Memory System v1
 ### Goal
-Add persistent logs and long-term memory.
+Provide durable memory without a database.
 
 ### Tasks
-- Implement `app/memory/store.py`:
+- Maintain `app/memory/store.py` for:
   - daily log append
-  - memory read/write
+  - long-term memory read/write
   - summary read/write
-- Implement `/remember` command.
-- Inject `MEMORY.md` into agent prompt.
-- Add recent summary loading logic.
-- Define initial tool bridge interfaces for:
+  - recent summary loading
+  - search by keyword/date
+- Keep long-term memory human-readable in `MEMORY.md`.
+- Maintain memory sections suitable for stable preferences and facts.
+- Keep `/remember` as the explicit user-facing memory write path.
+- Ensure memory is injected on every turn.
+
+### Deliverables
+- readable workspace logs, summaries, and `MEMORY.md`
+- durable explicit memory across turns and restarts
+
+### Exit Criteria
+- A saved preference remains available on later turns.
+- Operators can inspect memory state directly from workspace files.
+
+---
+
+## Phase 7 — Memory Consolidation and Background Work
+### Goal
+Turn raw logs into reusable summaries and keep memory maintenance off the hot path.
+
+### Tasks
+- Maintain background execution through `app/memory/worker.py`.
+- Keep summary generation in `app/memory/consolidate.py`.
+- Keep memory merge logic capable of rewriting `MEMORY.md` with deduplicated content.
+- Trigger consolidation from `/clear`.
+- Clarify and complete the `/clear` workflow so that summary generation and memory merge are explicitly coordinated.
+- Improve failure handling so failed consolidation preserves raw logs and produces diagnosable errors.
+
+### Deliverables
+- asynchronous memory maintenance
+- summary generation pipeline
+- deterministic consolidation behavior for `/clear`
+
+### Exit Criteria
+- `/clear` resets turn-level context without losing important long-term memory.
+- Consolidation failures do not corrupt raw logs or workspace state.
+
+---
+
+## Phase 8 — Local Tool Bridge
+### Goal
+Expose Python-side memory and scheduler operations to the agent through a simple local contract.
+
+### Tasks
+- Maintain the workspace-local `tools/tool_bridge.py` pattern.
+- Keep `tools/README.md` generated with command usage guidance.
+- Expose memory operations:
   - `memory_search`
   - `memory_list_by_date`
   - `memory_save`
+- Expose scheduler operations:
+  - `schedule_task`
+  - `list_tasks`
+  - `delete_task`
+- Keep command I/O structured as JSON.
+- Record tool invocations in `tool_audit.jsonl`.
 
 ### Deliverables
-- readable memory files with memory-aware conversations
+- local command-based bridge usable from agent workspaces
+- audit trail for tool calls
 
 ### Exit Criteria
-- User can save a preference and the agent recalls it in a later turn.
+- The agent can invoke memory and scheduler tools from the workspace environment.
+- Tool invocations are auditable from disk.
 
-## Phase 7 — Memory Consolidation
+---
+
+## Phase 9 — Scheduler and Proactive Execution
 ### Goal
-Turn raw logs into concise reusable memory.
+Support one-time and recurring tasks through the same runtime pipeline.
 
 ### Tasks
-- Implement `app/memory/consolidate.py`.
-- Trigger consolidation on `/clear`.
-- Summarize new log segments.
-- Rewrite `MEMORY.md` with deduplicated content.
-- Add failure-safe behavior if consolidation fails.
+- Maintain `app/scheduler/store.py` and `app/scheduler/loop.py`.
+- Persist tasks in `data/schedules.json`.
+- Persist execution history in `data/schedule_runs.json`.
+- Poll for due tasks on a configurable interval.
+- Support both `once` and `cron` schedules.
+- Route due tasks back through Dispatcher.
+- Keep overlap protection for task execution.
+- Ensure scheduler failures do not crash the main service.
 
 ### Deliverables
-- `/clear` resets current context but preserves learned facts
+- proactive reminder execution
+- task listing and deletion support
+- execution log for scheduled runs
 
 ### Exit Criteria
-- After `/clear`, important preferences remain available while turn-level context is cleared.
+- A scheduled task can be created, executed, and logged.
+- Overlapping runs are skipped or controlled instead of duplicated.
 
-## Phase 8 — Scheduler v1
+---
+
+## Phase 10 — Hardening and Operator Experience
 ### Goal
-Allow proactive tasks via cron and once schedules.
+Close the gap between functional correctness and daily reliability.
 
 ### Tasks
-- Implement `app/scheduler/store.py`.
-- Implement `app/scheduler/loop.py`.
-- Add polling loop startup in `main.py`.
-- Support cron and one-time schedules.
-- Route due tasks through Dispatcher.
-- Add `/tasks` command.
-- Add schedule execution logging.
+- Add or maintain atomic writes for JSON-backed state where practical.
+- Improve corruption handling and diagnostics for JSON state files.
+- Tighten provider-specific tests for resume, streaming, and error cases.
+- Expand manual and automated validation for Feishu delivery failures.
+- Keep README, spec, implementation plan, and task tracking aligned.
+- Ensure operator-facing commands cover start, stop, restart, and status inspection.
 
 ### Deliverables
-- proactive reminders and recurring tasks
+- more restart-safe local service
+- clearer operator diagnostics
+- documentation aligned with actual runtime behavior
 
 ### Exit Criteria
-- User can create a reminder and receive it at the scheduled time in Feishu.
+- The service can recover cleanly from normal restarts.
+- Operational failures are observable from local files and logs.
 
-## Phase 9 — Tool Bridge for Gemini
-### Goal
-Expose Python-side capabilities to the Gemini agent cleanly.
+---
 
-### Tasks
-- Finalize one tool bridge approach:
-  - MCP if Gemini CLI supports it well
-  - otherwise subprocess-exposed local command tools
-- Expose memory tools.
-- Expose scheduler tools.
-- Define input/output schemas.
-- Add audit logging for tool invocations.
+## Recommended Milestone Breakdown
 
-### Deliverables
-- Gemini agent can read/write memory and schedules without hardcoded dispatcher shortcuts
-
-### Exit Criteria
-- Agent can autonomously save memory or create a schedule from natural language.
-
-## Phase 10 — Skill Extension Framework
-### Goal
-Support specialized workflows without changing core modules.
-
-### Tasks
-- Define `skills/` directory contract.
-- Add skill discovery and mounting into workspaces.
-- Add instruction loading rules.
-- Add local Python tool wrappers for skill APIs.
-- Create one reference skill stub.
-
-### Deliverables
-- pluggable skill system
-
-### Exit Criteria
-- A new skill can be added by dropping files into the skills directory.
-
-## Phase 11 — Hardening and Operator Experience
-### Goal
-Make the system maintainable for daily use.
-
-### Tasks
-- Improve error messages and fallback cards.
-- Add atomic file writes for JSON stores.
-- Add lock or skip logic for overlapping scheduled task runs.
-- Add startup self-checks for required config.
-- Add README and operator runbook.
-
-### Deliverables
-- daily-usable local assistant service
-
-### Exit Criteria
-- Service can restart safely and recover prior state from disk.
-
-## Suggested Milestone Breakdown
-
-### Milestone A
+### Milestone A — Runtime Baseline
 - Phase 0
 - Phase 1
 - Phase 2
-
-### Milestone B
 - Phase 3
+
+### Milestone B — Provider and Workspace Reliability
 - Phase 4
 - Phase 5
 
-### Milestone C
+### Milestone C — Durable Context
 - Phase 6
 - Phase 7
-
-### Milestone D
 - Phase 8
+
+### Milestone D — Proactive Execution
 - Phase 9
 
-### Milestone E
+### Milestone E — Hardening
 - Phase 10
-- Phase 11
 
-## Test Plan by Phase
+---
 
-### Core Tests
-- config loading
+## Validation Plan
+
+### Unit-Level Coverage
+- config parsing and validation
 - workspace bootstrap
-- dedup file updates
 - session persistence
-- daily log writing
+- command parsing
+- memory read/write behavior
 - schedule next-run calculation
+- tool bridge command parsing
 
-### Integration Tests
-- Feishu message -> Dispatcher -> stub reply
-- Feishu message -> Gemini CLI -> reply
-- `/clear` -> consolidation -> new conversation
-- schedule creation -> due execution -> Feishu delivery
+### Integration Coverage
+- Feishu message -> Dispatcher -> provider reply
+- Feishu message -> streaming reply path
+- `/remember` -> memory persistence -> later recall
+- `/clear` -> consolidation workflow -> later recall
+- schedule creation -> due execution -> delivery -> execution log
+- tool bridge command -> JSON output -> audit log
 
-### Manual Acceptance Tests
-- multi-turn memory recall
-- explicit remember preference
-- restart process and continue conversation
-- run one-time reminder
-- run daily recurring reminder
+### Manual Acceptance Checks
+- switch between Gemini and Claude providers
+- continue a multi-turn conversation after restart
+- create a one-time reminder and receive it
+- create a recurring task and confirm next-run updates
+- inspect logs, summaries, schedules, and sessions directly on disk
+- verify fallback behavior when Feishu delivery fails
 
-## Initial File Creation Priorities
-Create these first for the skeleton:
-- `pyproject.toml`
-- `.env.example`
-- `app/main.py`
-- `app/config.py`
-- `app/dispatcher.py`
-- `app/gateway/feishu.py`
-- `app/agent/engine.py`
-- `app/agent/workspace.py`
-- `app/agent/session_store.py`
-- `app/memory/store.py`
-- `app/scheduler/store.py`
-- `app/scheduler/loop.py`
-- `app/rendering/cards.py`
-- templates markdown files
-
-## Recommended First Coding Order
-1. config + startup
-2. Feishu gateway echo
-3. dispatcher
-4. Gemini adapter
-5. workspace bootstrap
-6. memory files
-7. scheduler
-8. tool bridge
-9. skills
+---
 
 ## Definition of Done
-The implementation is considered successful when:
-- the service runs locally from a single command
-- Feishu chat works end-to-end through Gemini CLI
-- persona and memory persist on disk
-- scheduled reminders work
-- code structure matches the spec closely enough for future iteration
-- adding a new skill does not require redesigning the core architecture
+A phase is done when:
+- the behavior described in the phase exists in code
+- the primary success path is exercised by tests or manual validation
+- the relevant file-backed state is inspectable on disk
+- operator-facing failure behavior is understandable
+- the plan, spec, and task tracking do not contradict the implementation

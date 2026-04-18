@@ -1,12 +1,12 @@
 # GeminiBot Feishu AI Assistant Spec
 
 ## Summary
-Design a Python-based Feishu AI assistant inspired by the OpenClaw-style architecture in the referenced article. The assistant runs as a long-lived local service, receives Feishu messages over WebSocket, delegates reasoning and execution to Gemini CLI Agent, maintains persistent memory, and supports proactive scheduled tasks. The system should be simple to operate on a personal machine, avoid unnecessary infrastructure, and keep all core state human-readable on disk.
+Design a Python-based Feishu AI assistant for local-first operation in Feishu. The assistant runs as a long-lived local service, receives Feishu messages over WebSocket, delegates reasoning and execution to a provider-selectable CLI agent runtime, maintains persistent memory, and supports proactive scheduled tasks. The system should be simple to operate on a personal machine, avoid unnecessary infrastructure, and keep all core state human-readable on disk.
 
 ## Goals
 - Build a Feishu AI assistant in Python that can chat, remember, and proactively execute tasks.
-- Use Gemini CLI Agent as the underlying agent runtime instead of Claude Code CLI.
-- Preserve the article’s modular architecture: gateway, agent engine, memory, scheduler, and skill/tool extensions.
+- Support Gemini CLI and Claude Code CLI as provider-selectable agent runtimes behind a shared Python adapter.
+- Preserve a modular architecture centered on gateway, agent engine, memory, and scheduler components.
 - Keep deployment lightweight: local process, no public callback URL, file-based state, minimal external dependencies.
 - Produce an implementation-friendly design that can evolve into a personal assistant for content creation, reminders, and workflow automation.
 
@@ -20,7 +20,7 @@ Design a Python-based Feishu AI assistant inspired by the OpenClaw-style archite
 ## Design Principles
 - **Local-first**: run on a developer laptop or private server.
 - **Readable state**: memory, persona, session metadata, and schedules are stored as plain files.
-- **Agent-native**: let Gemini CLI Agent own reasoning and tool invocation as much as possible.
+- **Agent-native**: let the selected CLI agent runtime own reasoning and tool invocation as much as possible.
 - **Loose coupling**: each module can be replaced independently.
 - **Safe autonomy**: proactive execution is supported, but external side effects should be explicit and auditable.
 
@@ -41,12 +41,12 @@ The system consists of five primary modules:
 
 2. **Dispatcher**
    - Converts incoming Feishu events into internal requests.
-   - Routes requests to the Gemini agent engine.
+   - Routes requests to the agent engine.
    - Persists conversation logs.
-   - Handles built-in commands like `/clear`, `/remember`, `/schedule`, `/tasks`.
+   - Handles built-in commands like `/clear`, `/remember`, `/schedule`, `/tasks`, and `/delete-task`.
 
-3. **Gemini Agent Engine**
-   - Invokes Gemini CLI Agent through Python subprocess management.
+3. **Agent Engine**
+   - Invokes the selected CLI provider through Python subprocess management.
    - Maintains per-conversation sessions/workspaces.
    - Injects system prompt, persona, memory, and recent summaries.
    - Returns structured results for Feishu rendering.
@@ -112,7 +112,7 @@ The system consists of five primary modules:
 - Reply with Markdown cards or plain text.
 
 #### Why WebSocket
-Following the article’s architecture, WebSocket avoids the need for public ingress and lowers operational complexity.
+WebSocket avoids the need for public ingress and lowers operational complexity for a local-first deployment model.
 
 #### Python Stack
 - `lark-oapi` or Feishu Python SDK
@@ -155,8 +155,9 @@ class OutgoingMessage(TypedDict):
 #### Command Set for v1
 - `/clear`: clear session context and trigger memory consolidation
 - `/remember <text>`: force-save a user preference/fact
-- `/schedule <natural language>`: ask the agent to create a schedule
+- `/schedule <once|cron> | <time-or-cron> | <prompt>`: create a structured scheduled task
 - `/tasks`: list current scheduled tasks
+- `/delete-task <task_id>`: delete a scheduled task
 - `/help`: show supported commands
 
 #### Flow
@@ -164,7 +165,7 @@ class OutgoingMessage(TypedDict):
 Gateway/Scheduler -> Dispatcher
   -> built-in command?
      -> yes: execute internal command and reply
-     -> no: call GeminiAgentEngine.run()
+     -> no: call AgentEngine.run()
   -> append daily log
   -> render Feishu card
 ```
@@ -175,28 +176,29 @@ Gateway/Scheduler -> Dispatcher
 
 ---
 
-### 3. Gemini Agent Engine
+### 3. Agent Engine
 #### Responsibilities
 - Prepare per-conversation workspaces.
-- Invoke Gemini CLI Agent via subprocess.
+- Invoke the selected CLI provider via subprocess.
 - Maintain conversation continuity across multiple user turns.
 - Append persona and memory context to each invocation.
 
-#### Why Gemini CLI Agent
-The user requirement is to use Gemini CLI Agent as the reasoning/execution backend. The Python service should treat it as an external agent runtime with:
+#### Why a provider-selectable CLI agent runtime
+The Python service treats the reasoning/execution backend as an external agent runtime with:
 - file and shell capabilities delegated to the CLI agent
-- session or checkpoint reuse if Gemini CLI supports it
+- session or checkpoint reuse if the selected CLI supports it
 - structured output parsing for reliable integration
 
 #### Invocation Strategy
-The engine should wrap Gemini CLI in a stable adapter layer.
+The engine should wrap each CLI in a stable adapter layer.
 
-Example conceptual call:
+Example conceptual calls:
 ```bash
-gemini -p "<user message>" --output-format json --session <session_id>
+gemini -p "<user message>" --output-format json --resume latest
+claude -p "<user message>" --output-format json --resume <session_id>
 ```
 
-If Gemini CLI uses different flags, the adapter should map internal concepts to actual CLI arguments.
+If a CLI uses different flags, the adapter should map internal concepts to actual CLI arguments.
 
 #### Workspace Strategy
 Each Feishu conversation gets a dedicated workspace:
@@ -209,11 +211,13 @@ Each Feishu conversation gets a dedicated workspace:
 ├── MEMORY.md
 ├── tools/
 ├── logs/
-└── session.json
+└── summaries/
 ```
 
+Session metadata is persisted in `data/sessions.json`.
+
 #### Persona Files
-Borrowing the article’s pattern, these files shape assistant behavior:
+These files shape assistant behavior:
 - `SOUL.md`: values, tone, behavior boundaries
 - `IDENTITY.md`: bot name, role, persona
 - `USER.md`: known user preferences and profile
@@ -329,39 +333,16 @@ Expose scheduler tools:
 
 ---
 
-### 6. Skill/Tool Extension Model
-#### Goal
-Provide a clean way to teach the assistant specialized business workflows.
-
-#### Design
-Instead of tightly coupling all features into the core service, define a lightweight plugin/skill mechanism.
-Each skill may include:
-- instruction markdown
-- Python wrappers around APIs
-- templates for content generation
-- validation rules for external side effects
-
-#### Initial Skill Targets
-- WeChat article generation/publishing
-- Xiaohongshu content generation/publishing
-- Daily brief generation
-- Personal reminders and recurring reports
-
-#### Gemini Agent Integration
-The core runtime should mount skill instructions and local tools into the workspace for the Gemini agent to use. The agent decides when to invoke them based on task context.
-
-#### Requirements
-- Skills must be installable without modifying core architecture.
-- External publishing skills must require explicit user instruction in v1.
-
 ## Data Model and Persistence
 
 ### File-Based State
 ```text
-data/sessions.json     # conversation_id -> gemini session metadata
-data/dedup.json        # recent message ids for deduplication
-data/schedules.json    # scheduled jobs
-workspaces/*           # per-conversation state
+data/sessions.json         # conversation_id -> provider-aware session metadata
+data/dedup.json            # recent message ids for deduplication
+data/schedules.json        # scheduled jobs
+data/schedule_runs.json    # scheduled task execution history
+data/unsent_messages.json  # failed outbound payloads for inspection
+workspaces/*               # per-conversation state
 ```
 
 ### Persistence Rules
@@ -375,19 +356,19 @@ workspaces/*           # per-conversation state
 ```text
 User sends message in Feishu
 -> Feishu Gateway receives event via WebSocket
--> Dispatcher deduplicates and normalizes
--> Gemini Agent Engine prepares workspace and prompt
--> Gemini CLI Agent runs with session restore
+-> Gateway deduplicates and normalizes
+-> Agent Engine prepares workspace and prompt
+-> Selected CLI agent runs with session restore
 -> Agent optionally reads/writes memory or schedules via tools
 -> Dispatcher appends log
--> Gateway returns Feishu card reply
+-> Gateway returns a Feishu card reply or streaming card update
 ```
 
 ### Proactive Scheduled Task
 ```text
 Scheduler loop detects due task
 -> Dispatcher creates synthetic incoming request
--> Gemini Agent Engine runs with same workspace/session model
+-> Agent Engine runs with same workspace/session model
 -> Result sent to target Feishu chat
 -> Scheduler updates or removes task
 -> Execution logged
@@ -400,16 +381,19 @@ Required:
 ```env
 FEISHU_APP_ID=
 FEISHU_APP_SECRET=
-GEMINI_API_KEY=
+AI_PROVIDER=gemini
 GEMINI_CLI_PATH=gemini
+CLAUDE_CLI_PATH=claude
 BOT_NAME=GeminiBot
-DEFAULT_TIMEZONE=Asia/Shanghai
-WORKSPACE_ROOT=~/geminibot/workspaces
-DATA_ROOT=~/geminibot/data
+APP_ROOT=~/geminibot
 ```
 
 Optional:
 ```env
+GEMINI_API_KEY=
+GEMINI_APPROVAL_MODE=yolo
+CLAUDE_PERMISSION_MODE=auto
+DEFAULT_TIMEZONE=America/Los_Angeles
 POLL_INTERVAL_SECONDS=30
 RECENT_SUMMARY_DAYS=7
 CARD_FOOTER_ENABLED=true
@@ -418,7 +402,6 @@ LOG_LEVEL=INFO
 
 ## Safety and Constraints
 - Destructive external actions must be gated by explicit user intent.
-- Publishing workflows should support dry-run mode first.
 - Tool audit logs should be stored for debugging.
 - The bot should identify itself consistently as the user’s personal assistant.
 - Secrets must stay in environment variables or secure local config, never in workspace memory files.
@@ -438,7 +421,7 @@ LOG_LEVEL=INFO
 - memory tool usage counts
 
 ## Failure Handling
-- If Gemini CLI invocation fails, return a user-friendly error card and log stderr.
+- If CLI invocation fails, return a user-friendly error card and log stderr.
 - If memory consolidation fails, keep raw logs and skip rewrite.
 - If a scheduled task fails, record failure and retry on the next valid run only if configured.
 - If Feishu send fails, store unsent payload for inspection.
@@ -463,28 +446,19 @@ LOG_LEVEL=INFO
 - schedule/list/delete tools
 - proactive task delivery to Feishu
 
-### Phase 4: Skills
-- pluggable skill directory
-- content publishing skills
-- explicit confirmation model for external posting
-
 ## Open Questions
-- What exact CLI flags and session semantics does Gemini CLI Agent expose for resume/structured output?
-- Should tool bridging use MCP directly, subprocess JSON-RPC, or a simpler stdin/stdout wrapper in v1?
 - Should long-term memory be shared globally across all conversations, or remain per-conversation plus optional global profile?
-- Do scheduled tasks need concurrency controls to prevent overlapping runs for long jobs?
-- Should card rendering support streaming/partial updates later?
+- Should natural-language schedule creation be added on top of the current structured `/schedule <once|cron> | <time-or-cron> | <prompt>` command?
+- Should memory consolidation on `/clear` guarantee both summary generation and `MEMORY.md` merge in one explicit workflow?
 
 ## Success Criteria
 - A user can message the bot in Feishu and receive a contextual answer.
 - The bot remembers explicit preferences across `/clear` and future sessions.
-- A user can create a scheduled reminder in natural language and receive it later.
+- A user can create a scheduled reminder and receive it later.
 - All core state is visible under `~/geminibot` as readable files.
-- The architecture is modular enough to add publishing skills without redesigning the core.
 
-## Appendix: Mapping from the Article to This Design
-- **Feishu gateway** stays the same in spirit: WebSocket, no public callback requirement.
-- **Agent engine** swaps Claude Code CLI for Gemini CLI Agent behind a Python adapter.
-- **Memory system** keeps the article’s file-first approach: daily logs, summaries, and long-term memory.
-- **Scheduler** keeps cron + polling because it is simple and transparent.
-- **Skill system** keeps the article’s idea of teaching the assistant specialized workflows, but adapts implementation to Python tooling around Gemini Agent.
+## Appendix: Design Rationale
+- **Feishu gateway** uses WebSocket to avoid public callback infrastructure.
+- **Agent engine** uses a provider-selectable CLI runtime behind a Python adapter.
+- **Memory system** uses a file-first approach with daily logs, summaries, and long-term memory.
+- **Scheduler** uses cron + polling because it is simple and transparent.
