@@ -243,6 +243,8 @@ class GeminiAgentEngine:
                 "--output-format",
                 output_format,
             ]
+            if self.config.claude_permission_mode != "default":
+                command.extend(["--permission-mode", self.config.claude_permission_mode])
             if output_format == "stream-json":
                 command.extend(["--verbose", "--include-partial-messages"])
             if session and session.get("provider") == "claude" and session.get("session_id"):
@@ -256,6 +258,8 @@ class GeminiAgentEngine:
             "--output-format",
             output_format,
         ]
+        if self.config.gemini_approval_mode != "default":
+            command.extend(["--approval-mode", self.config.gemini_approval_mode])
         if session and session.get("provider") == "gemini" and session.get("resume"):
             command.extend(["--resume", session["resume"]])
         return command

@@ -84,7 +84,14 @@ FEISHU_APP_SECRET=your_feishu_app_secret
 AI_PROVIDER=gemini
 GEMINI_CLI_PATH=gemini
 CLAUDE_CLI_PATH=claude
+GEMINI_APPROVAL_MODE=yolo
+CLAUDE_PERMISSION_MODE=auto
 ```
+
+Provider-specific approval settings:
+
+- `GEMINI_APPROVAL_MODE` applies only when `AI_PROVIDER=gemini` and maps to Gemini CLI `--approval-mode`
+- `CLAUDE_PERMISSION_MODE` applies only when `AI_PROVIDER=claude` and maps to Claude CLI `--permission-mode`
 
 Useful optional settings:
 

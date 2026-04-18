@@ -26,6 +26,8 @@ class AppConfig:
     ai_provider: str
     gemini_cli_path: str
     claude_cli_path: str
+    gemini_approval_mode: str
+    claude_permission_mode: str
     bot_name: str
     default_timezone: str
     app_root: Path
@@ -55,6 +57,8 @@ class AppConfig:
             ai_provider=os.getenv("AI_PROVIDER", "gemini").strip().lower() or "gemini",
             gemini_cli_path=os.getenv("GEMINI_CLI_PATH", "gemini"),
             claude_cli_path=os.getenv("CLAUDE_CLI_PATH", "claude"),
+            gemini_approval_mode=os.getenv("GEMINI_APPROVAL_MODE", "default").strip().lower() or "default",
+            claude_permission_mode=os.getenv("CLAUDE_PERMISSION_MODE", "default").strip() or "default",
             bot_name=os.getenv("BOT_NAME", "GeminiBot"),
             default_timezone=os.getenv("DEFAULT_TIMEZONE", "Asia/Shanghai"),
             app_root=app_root,
@@ -71,6 +75,10 @@ class AppConfig:
             raise ValueError("Missing required Feishu configuration: FEISHU_APP_ID and FEISHU_APP_SECRET are required.")
         if self.ai_provider not in {"gemini", "claude"}:
             raise ValueError(f"Unsupported AI_PROVIDER: {self.ai_provider}")
+        if self.gemini_approval_mode not in {"default", "auto_edit", "plan", "yolo"}:
+            raise ValueError(f"Unsupported GEMINI_APPROVAL_MODE: {self.gemini_approval_mode}")
+        if self.claude_permission_mode not in {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}:
+            raise ValueError(f"Unsupported CLAUDE_PERMISSION_MODE: {self.claude_permission_mode}")
 
         cli_path = self.selected_cli_path
         if not cli_path.strip():
